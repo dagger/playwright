@@ -93,9 +93,10 @@ on `dagger api call playwright`):
 - **`baseImageAddress`** (default: derive): the image tests run in. By default
   it is derived from your project's `@playwright/test` version
   (`mcr.microsoft.com/playwright:v<version>-noble`), so browsers always match
-  your Playwright version. Derivation reads the *declared* version, so pin it
-  exactly (or commit a lockfile) — a floating range like `^1.58.2` can install
-  a newer Playwright than the derived image's browsers.
+  your Playwright version. Derivation prefers the version installed per
+  `package-lock.json`; without a lockfile it falls back to the version
+  declared in `package.json`, so pin that exactly — a floating range like
+  `^1.58.2` can install a newer Playwright than the derived image's browsers.
 - **`baseCtr`**: a full `Container` override, also wireable
   (`baseCtr = "base-images:chromium"`). `npx playwright` must work in it after
   dependency install.
@@ -104,11 +105,24 @@ on `dagger api call playwright`):
 - **`localhostProxy`** (default `false`): see secure contexts above.
 - **`args`** (default `[]`): extra arguments for every `playwright test`
   invocation, e.g. `["--project", "chromium"]`.
+- **`shards`** (default `1`): number of parallel shard containers `test` runs —
+  this is how you shard the `playwright:test` check.
+
+Two things to know about the test environment:
+
+- The module sets `CI=true`, so anything your `playwright.config` keys off
+  `process.env.CI` (workers, retries, `forbidOnly`) applies. In particular,
+  a `workers: process.env.CI ? 1 : undefined` clamp serializes the whole
+  suite — prefer a bounded value like `4` (the container is isolated, but
+  unbounded workers can starve the browsers and blow test timeouts).
+- Branded browser channels (`msedge`, `chrome`) are not present in the
+  Playwright images — remove those projects or scope runs with `args`.
 
 ## Sharding
 
-```sh
-dagger api call playwright test --shards=4
+```toml
+[modules.playwright.settings]
+shards = 4
 ```
 
 Shards run in parallel containers against the same wired service and fail fast

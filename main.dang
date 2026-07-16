@@ -35,6 +35,7 @@ type Playwright {
   pub packageManager: String!
   pub localhostProxy: Boolean!
   pub args: [String!]!
+  pub shards: Int!
 
   new(
     ws: Workspace!,
@@ -83,6 +84,11 @@ type Playwright {
     (e.g. ["--project", "chromium"]).
     """
     args: [String!]! = [],
+    """
+    Default number of parallel test shards for `test` — set this to shard
+    the `playwright:test` check.
+    """
+    shards: Int! = 1,
   ) {
     if (sourcePath != "") {
       self.source = ws.directory(sourcePath, exclude: ["node_modules"])
@@ -116,38 +122,76 @@ type Playwright {
     self.packageManager = packageManager
     self.localhostProxy = localhostProxy
     self.args = args
+    self.shards = shards
     self
+  }
+
+  # The @playwright/test version actually installed per package-lock.json,
+  # or null when there is no lockfile entry.
+  let lockedVersion: String {
+    let lock = if (source.exists("package-lock.json")) {
+      source.file("package-lock.json").contents
+    } else {
+      ""
+    }
+    let entry = lock.split(`"node_modules/@playwright/test"`)[1]
+    if (entry == null) {
+      null
+    } else {
+      let v = entry.split(`"version": "`)[1]
+      if (v == null) {
+        null
+      } else {
+        v.split(`"`)[0]
+      }
+    }
+  }
+
+  # Image derived from the version range declared in package.json,
+  # falling back to the module's pinned default.
+  let declaredImage: String! {
+    let pkg = if (source.exists("package.json")) {
+      source.file("package.json").contents
+    } else {
+      ""
+    }
+    # Extract the version from `"@playwright/test": "<range>"`.
+    let after = pkg.split(`"@playwright/test"`)[1]
+    if (after == null) {
+      fallbackImage
+    } else {
+      let ver = after.split(`"`)[1]
+      if (ver == null) {
+        fallbackImage
+      } else {
+        let clean = ver.trimLeft("^~>=< ")
+        if (clean == "") {
+          fallbackImage
+        } else {
+          `mcr.microsoft.com/playwright:v${clean}-noble`
+        }
+      }
+    }
   }
 
   """
   The resolved Playwright image address: the explicit baseImageAddress when
-  set, else derived from the project's @playwright/test version, else the
-  module's pinned fallback.
+  set; else derived from the @playwright/test version installed per the
+  project's lockfile; else from the version declared in package.json; else
+  the module's pinned fallback.
   """
   pub imageAddress: String! {
     if (baseImageAddress != "") {
       baseImageAddress
     } else {
-      let pkg = if (source.exists("package.json")) {
-        source.file("package.json").contents
+      let locked = lockedVersion
+      if (locked == null) {
+        declaredImage
       } else {
-        ""
-      }
-      # Extract the version from `"@playwright/test": "<range>"`.
-      let after = pkg.split(`"@playwright/test"`)[1]
-      if (after == null) {
-        fallbackImage
-      } else {
-        let ver = after.split(`"`)[1]
-        if (ver == null) {
-          fallbackImage
+        if (locked == "") {
+          declaredImage
         } else {
-          let clean = ver.trimLeft("^~>=< ")
-          if (clean == "") {
-            fallbackImage
-          } else {
-            `mcr.microsoft.com/playwright:v${clean}-noble`
-          }
+          `mcr.microsoft.com/playwright:v${locked}-noble`
         }
       }
     }
@@ -224,14 +268,9 @@ type Playwright {
   }
 
   """
-  Run the Playwright test suite, optionally sharded across parallel containers.
+  Run the Playwright test suite, sharded across `shards` parallel containers.
   """
-  pub test(
-    """
-    Number of parallel test shards
-    """
-    shards: Int! = 1,
-  ): Void @check {
+  pub test: Void @check {
     let b = base
     let runs = range(shards).map { i => b.withExec(testCommand(`${i}/${shards}`)) }
     # {{ }} forces every shard concurrently, failing fast on the first error

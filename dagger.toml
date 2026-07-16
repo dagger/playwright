@@ -6,6 +6,8 @@ source = "."
 # Wire the e2e fixture server in and exercise the localhost secure-context proxy.
 service = "fixtures:server"
 localhostProxy = true
+# Exercise sharding in the e2e
+shards = 2
 
 [modules.fixtures]
 source = ".dagger/modules/fixtures"
