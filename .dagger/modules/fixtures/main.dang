@@ -1,0 +1,32 @@
+"""
+End-to-end fixtures for the playwright module.
+
+Provides a static web server that the workspace wires into the playwright
+module (settings.service = "fixtures:server"), so `dagger check` exercises
+the full service-binding + localhost-proxy path against the fixture project.
+"""
+type Fixtures {
+  """
+  A static file server hosting the fixture page on port 8080.
+  """
+  pub server: Service! {
+    container
+      .from("python:3.12-alpine")
+      .withNewFile(
+        "/www/index.html",
+        """
+        <!doctype html>
+        <html>
+          <head><title>Playwright E2E Fixture</title></head>
+          <body><h1 id="greeting">hello from the fixture server</h1></body>
+        </html>
+        """,
+      )
+      .withWorkdir("/www")
+      .withExposedPort(8080)
+      # entrypoint + useEntrypoint avoids evaluating the container to derive
+      # the service command from a prior withExec
+      .withEntrypoint(["python3", "-m", "http.server", "8080"])
+      .asService(useEntrypoint: true)
+  }
+}

@@ -1,0 +1,252 @@
+pub description = "Run Playwright browser tests against your project, with workspace service wiring"
+
+# Fallback image when the project's @playwright/test version can't be derived.
+let fallbackImage = "mcr.microsoft.com/playwright:v1.58.2-noble"
+
+# range returns [1, 2, ..., n]
+let range(n: Int!): [Int!]! {
+  if (n <= 0) {
+    [] :: [Int!]!
+  } else {
+    range(n - 1) + [n]
+  }
+}
+
+type Playwright {
+  """
+  The Playwright project directory (contains playwright.config.*), discovered
+  from the workspace or chosen via sourcePath.
+  """
+  pub source: Directory!
+
+  """
+  Base container override. When null, the image is derived from the project's
+  @playwright/test version.
+  """
+  pub baseCtr: Container
+
+  """
+  Service under test, bound into the test container as `serviceHostname`.
+  """
+  pub service: Service
+
+  pub serviceHostname: String!
+  pub baseImageAddress: String!
+  pub packageManager: String!
+  pub localhostProxy: Boolean!
+  pub args: [String!]!
+
+  new(
+    ws: Workspace!,
+    """
+    Workspace path of the Playwright project. Empty (default) discovers the
+    directory containing playwright.config.* — required when the workspace
+    holds more than one Playwright project.
+    """
+    sourcePath: String! = "",
+    """
+    Base container to use instead of the derived Playwright image
+    (wireable: settings.baseCtr = "<module>:<function>" for any Container-returning function).
+    `npx playwright` must work inside it after dependency install.
+    """
+    baseCtr: Container,
+    """
+    Service to run tests against
+    (wireable: settings.service = "<module>:<function>" for any Service-returning function).
+    Bound as `serviceHostname`; PLAYWRIGHT_BASE_URL is set to its first exposed port.
+    Omit it when your playwright.config uses its own webServer.
+    """
+    service: Service,
+    """
+    Hostname the service is bound as inside the test container.
+    """
+    serviceHostname: String! = "frontend",
+    """
+    Playwright image to run tests in. Empty (default) derives
+    mcr.microsoft.com/playwright:v<version>-noble from the project's
+    @playwright/test dependency. The image's browsers must match that version.
+    """
+    baseImageAddress: String! = "",
+    """
+    Package manager used to install the project's dependencies (npm, yarn, pnpm, bun).
+    """
+    packageManager: String! = "npm",
+    """
+    Proxy localhost:<port> to the bound service via socat, and set
+    PLAYWRIGHT_LOCALHOST_BASE_URL. For tests that need a secure context
+    (service workers, WebCrypto) — those require a localhost or HTTPS origin.
+    Requires an apt-based base image (the default images qualify).
+    """
+    localhostProxy: Boolean! = false,
+    """
+    Extra arguments passed to every `playwright test` invocation
+    (e.g. ["--project", "chromium"]).
+    """
+    args: [String!]! = [],
+  ) {
+    if (sourcePath != "") {
+      self.source = ws.directory(sourcePath, exclude: ["node_modules"])
+    } else {
+      let matches = ws.directory(".", include: ["**/playwright.config.*"]).glob("**/playwright.config.*")
+      # Ignore configs inside hidden directories (editor state, stale worktrees).
+      let visible = matches.filter { m => !m.hasPrefix(".") and !m.contains("/.") }
+      if (visible.isEmpty) {
+        raise "no playwright.config.* found in workspace; set sourcePath to your Playwright project"
+      }
+      if (visible.length > 1) {
+        raise `multiple Playwright projects found (${visible.join(", ")}); set sourcePath to choose one`
+      }
+      let first = visible[0]
+      if (first == null) {
+        raise "no playwright.config.* found in workspace"
+      } else {
+        # parent dir of the config: trim the filename (last path segment)
+        let filename = first.split("/").reduce("") { acc, part => part }
+        let projectDir = first.trimSuffix(filename).trimSuffix("/")
+        self.source = ws.directory(
+          if (projectDir == "") { "." } else { projectDir },
+          exclude: ["node_modules"],
+        )
+      }
+    }
+    self.baseCtr = baseCtr
+    self.service = service
+    self.serviceHostname = serviceHostname
+    self.baseImageAddress = baseImageAddress
+    self.packageManager = packageManager
+    self.localhostProxy = localhostProxy
+    self.args = args
+    self
+  }
+
+  """
+  The resolved Playwright image address: the explicit baseImageAddress when
+  set, else derived from the project's @playwright/test version, else the
+  module's pinned fallback.
+  """
+  pub imageAddress: String! {
+    if (baseImageAddress != "") {
+      baseImageAddress
+    } else {
+      let pkg = if (source.exists("package.json")) {
+        source.file("package.json").contents
+      } else {
+        ""
+      }
+      # Extract the version from `"@playwright/test": "<range>"`.
+      let after = pkg.split(`"@playwright/test"`)[1]
+      if (after == null) {
+        fallbackImage
+      } else {
+        let ver = after.split(`"`)[1]
+        if (ver == null) {
+          fallbackImage
+        } else {
+          let clean = ver.trimLeft("^~>=< ")
+          if (clean == "") {
+            fallbackImage
+          } else {
+            `mcr.microsoft.com/playwright:v${clean}-noble`
+          }
+        }
+      }
+    }
+  }
+
+  # servicePort is the first exposed port of the bound service
+  let servicePort: Int! {
+    let svc = service
+    if (svc == null) {
+      raise "no service bound"
+    } else {
+      let first = svc.ports.{{ port }}[0]
+      if (first == null) {
+        raise "service has no exposed ports"
+      } else {
+        first.port
+      }
+    }
+  }
+
+  """
+  A container with the project mounted at /app and dependencies installed.
+  When a service is bound, PLAYWRIGHT_BASE_URL points at it — your
+  playwright.config should consume it:
+    use: { baseURL: process.env.PLAYWRIGHT_BASE_URL || "http://localhost:3000" }
+  With localhostProxy, PLAYWRIGHT_LOCALHOST_BASE_URL is also set.
+  """
+  pub base: Container! {
+    let ctr = if (baseCtr != null) { baseCtr } else { container.from(imageAddress) }
+    let prepared = ctr
+      .withMountedCache("/root/.packages", cacheVolume("playwright-packages"))
+      .withEnvVariable("npm_config_cache", "/root/.packages")
+      .withEnvVariable("YARN_CACHE_FOLDER", "/root/.packages")
+      .withEnvVariable("PNPM_HOME", "/root/.packages")
+      .withEnvVariable("BUN_INSTALL_CACHE_DIR", "/root/.packages")
+      .withDirectory("/app", source)
+      .withWorkdir("/app")
+      .withEnvVariable("CI", "true")
+    # yarn and pnpm ship via corepack on Node-based images
+    let withPm = if (packageManager == "yarn" or packageManager == "pnpm") {
+      prepared.withExec(["corepack", "enable"])
+    } else {
+      prepared
+    }
+    let installed = withPm.withExec([packageManager, "install"])
+    let svc = service
+    if (svc == null) {
+      installed
+    } else {
+      let bound = installed
+        .withServiceBinding(serviceHostname, svc)
+        .withEnvVariable("PLAYWRIGHT_BASE_URL", `http://${serviceHostname}:${servicePort}`)
+      if (localhostProxy) {
+        bound
+          .withExec(["apt-get", "update", "-qq"])
+          .withExec(["apt-get", "install", "-y", "-qq", "socat"])
+          .withEnvVariable("PLAYWRIGHT_LOCALHOST_BASE_URL", `http://localhost:${servicePort}`)
+      } else {
+        bound
+      }
+    }
+  }
+
+  # testCommand builds the exec for one shard, wrapping in a socat localhost
+  # proxy when enabled.
+  let testCommand(shard: String!): [String!]! {
+    let testArgs = ["npx", "playwright", "test"] + args + [`--shard=${shard}`]
+    if (localhostProxy and service != null) {
+      # Background socat so localhost:<port> reaches the service during the run.
+      ["sh", "-c", `socat TCP-LISTEN:${servicePort},fork,reuseaddr TCP:${serviceHostname}:${servicePort} & exec ${testArgs.join(" ")}`]
+    } else {
+      testArgs
+    }
+  }
+
+  """
+  Run the Playwright test suite, optionally sharded across parallel containers.
+  """
+  pub test(
+    """
+    Number of parallel test shards
+    """
+    shards: Int! = 1,
+  ): Void @check {
+    let b = base
+    let runs = range(shards).map { i => b.withExec(testCommand(`${i}/${shards}`)) }
+    # {{ }} forces every shard concurrently, failing fast on the first error
+    runs.{{ out: stdout }}
+    null
+  }
+
+  """
+  Run the suite tolerating failures and return the HTML report directory
+  (reporter: 'html' must be configured). Single-run — shard report merging is
+  not yet supported.
+  """
+  pub report: Directory! {
+    base
+      .withExec(testCommand("1/1"), expect: ReturnType.ANY)
+      .directory("playwright-report")
+  }
+}

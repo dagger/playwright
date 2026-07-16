@@ -1,0 +1,9 @@
+name = "playwright"
+engineVersion = "v1.0.0-beta.6"
+
+[runtime]
+  source = "dang"
+
+# Module code is main.dang only — don't haul the workspace's fixtures and
+# nested modules into the module load.
+include = ["!.dagger", "!fixture", "!README.md"]

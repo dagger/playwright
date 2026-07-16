@@ -1,0 +1,16 @@
+[modules.playwright]
+source = "."
+
+[modules.playwright.settings]
+
+# Wire the e2e fixture server in and exercise the localhost secure-context proxy.
+service = "fixtures:server"
+localhostProxy = true
+
+[modules.fixtures]
+source = ".dagger/modules/fixtures"
+
+[modules.dang-sdk]
+source = "github.com/dagger/dang-sdk"
+# Marker filename that skips generate when found at or above a Dang SDK module root.
+# settings.skipGenerateFilename = ""
