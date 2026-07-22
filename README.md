@@ -147,8 +147,8 @@ not yet supported.)
 
 ## Development
 
-This repo is its own e2e fixture: the workspace wires
-`.dagger/modules/fixtures`' static server into the module
-(`settings.service = "fixtures:server"`) and `fixture/` holds a minimal
-Playwright project, so `dagger check` exercises discovery, version derivation,
-service wiring, and the localhost proxy end to end.
+This repo is its own e2e fixture: `.dagger/modules/e2e` runs the toolchain
+against the minimal Playwright project in `fixture/`, with
+`.dagger/modules/fixtures`' static server bound as the service under test,
+so `dagger check` exercises discovery, version derivation, service wiring,
+the localhost proxy, and sharding end to end.
