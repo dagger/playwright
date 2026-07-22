@@ -12,7 +12,7 @@ any module function that returns a `Service` and your tests run against it.
 | -------------- | ---------------------------------------------------------------------------- |
 | `test`         | Run the test suite, optionally sharded across parallel containers (a `@check`). |
 | `report`       | Run the suite tolerating failures; returns the HTML report `Directory`.       |
-| `base`         | The prepared test container (project mounted, deps installed, service bound). |
+| `base`         | The prepared test container (workspace mounted, deps installed, service bound). |
 | `imageAddress` | The resolved Playwright image (useful to debug version derivation).           |
 
 ## Usage
@@ -35,6 +35,16 @@ Export the HTML report after a failing run:
 ```sh
 dagger api call playwright report -o ./playwright-report
 ```
+
+## Working directory awareness
+
+The module is aware of where in the workspace you invoke it: project discovery
+searches for `playwright.config.*` at or below your current directory, and
+`sourcePath` resolves relative to it (absolute paths resolve from the
+workspace root). The whole workspace is still mounted into the test container,
+with the project directory as the working directory, so configuration and
+dependencies that live above the project — monorepo roots, shared configs —
+keep resolving.
 
 ## Wiring a service under test
 
@@ -83,10 +93,11 @@ tests to use.
 Configured under `[modules.playwright.settings]` in `dagger.toml` (or as flags
 on `dagger api call playwright`):
 
-- **`sourcePath`** (default: discover): workspace path of the Playwright
-  project. By default the module finds the directory containing
-  `playwright.config.*`; setting this is required when the workspace holds
-  more than one Playwright project.
+- **`sourcePath`** (default: discover): path of the Playwright project,
+  relative to your current directory (absolute paths resolve from the
+  workspace root). By default the module finds the directory containing
+  `playwright.config.*` at or below your current directory; setting this is
+  required when the workspace holds more than one Playwright project.
 - **`service`**: module reference (`"module:function"`) of the service under
   test.
 - **`serviceHostname`** (default `frontend`): hostname the service is bound as.
