@@ -46,6 +46,11 @@ with the project directory as the working directory, so configuration and
 dependencies that live above the project — monorepo roots, shared configs —
 keep resolving.
 
+Dependencies are installed at the nearest `package.json` at or above the
+project, so a project without its own `package.json` installs from its
+monorepo root. When the workspace has none at all, the install is skipped
+and `npx` fetches Playwright on demand.
+
 ## Wiring a service under test
 
 If another module in your workspace serves your app, wire it into the tests in

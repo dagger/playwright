@@ -26,6 +26,18 @@ let workspacePath(cwd: String!, p: String!): String! {
   }
 }
 
+# installDirFor returns the directory holding the nearest package.json at or
+# above the project path, or null when the workspace has none.
+let installDirFor(ws: Workspace!, path: String!): String {
+  let pkg = ws.findUp("package.json", from: path)
+  if (pkg == null) {
+    null
+  } else {
+    let dir = pkg.trimSuffix("package.json").trimSuffix("/")
+    if (dir == "") { "/" } else { dir }
+  }
+}
+
 type Playwright {
   """
   The workspace root directory.
@@ -38,6 +50,14 @@ type Playwright {
   Discovered from the client's working directory or chosen via sourcePath.
   """
   pub path: String!
+
+  """
+  Root-absolute path of the directory holding the nearest package.json at or
+  above the project — where dependencies are installed. Null when the
+  workspace has none: the install is skipped and npx fetches Playwright on
+  demand.
+  """
+  pub installDir: String
 
   """
   Base container override. When null, the image is derived from the project's
@@ -135,6 +155,7 @@ type Playwright {
       }
     }
     self.source = ws.directory("/", exclude: ["**/node_modules"])
+    self.installDir = installDirFor(ws, self.path)
     self.baseCtr = baseCtr
     self.service = service
     self.serviceHostname = serviceHostname
@@ -146,16 +167,18 @@ type Playwright {
     self
   }
 
-  # The Playwright project directory within the workspace.
-  let project: Directory! {
-    source.directory(path)
+  # The directory whose package.json / lockfile declare the Playwright
+  # dependency — the install root when one exists, else the project.
+  let pkgRoot: Directory! {
+    let dir = installDir
+    if (dir == null) { source.directory(path) } else { source.directory(dir) }
   }
 
   # The @playwright/test version actually installed per package-lock.json,
   # or null when there is no lockfile entry.
   let lockedVersion: String {
-    let lock = if (project.exists("package-lock.json")) {
-      project.file("package-lock.json").contents
+    let lock = if (pkgRoot.exists("package-lock.json")) {
+      pkgRoot.file("package-lock.json").contents
     } else {
       ""
     }
@@ -175,8 +198,8 @@ type Playwright {
   # Image derived from the version range declared in package.json,
   # falling back to the module's pinned default.
   let declaredImage: String! {
-    let pkg = if (project.exists("package.json")) {
-      project.file("package.json").contents
+    let pkg = if (pkgRoot.exists("package.json")) {
+      pkgRoot.file("package.json").contents
     } else {
       ""
     }
@@ -262,7 +285,15 @@ type Playwright {
     } else {
       prepared
     }
-    let installed = withPm.withExec([packageManager, "install"])
+    let dir = installDir
+    let installed = if (dir == null) {
+      withPm
+    } else {
+      withPm.
+        withWorkdir("/app" + dir).
+        withExec([packageManager, "install"]).
+        withWorkdir("/app" + path)
+    }
     let svc = service
     if (svc == null) {
       installed
