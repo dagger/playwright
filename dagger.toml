@@ -1,13 +1,5 @@
-[modules.playwright]
-source = "."
-
-[modules.playwright.settings]
-
-# Wire the e2e fixture server in and exercise the localhost secure-context proxy.
-service = "fixtures:server"
-localhostProxy = true
-# Exercise sharding in the e2e
-shards = 2
+[modules.e2e]
+source = ".dagger/modules/e2e"
 
 [modules.fixtures]
 source = ".dagger/modules/fixtures"
@@ -16,3 +8,15 @@ source = ".dagger/modules/fixtures"
 source = "github.com/dagger/dang-sdk"
 # Marker filename that skips generate when found at or above a Dang SDK module root.
 # settings.skipGenerateFilename = ""
+
+[modules.dang-sdk.as-sdk]
+name = "dang"
+
+[[modules.dang-sdk.as-sdk.modules]]
+path = "."
+
+[[modules.dang-sdk.as-sdk.modules]]
+path = ".dagger/modules/fixtures"
+
+[[modules.dang-sdk.as-sdk.modules]]
+path = ".dagger/modules/e2e"

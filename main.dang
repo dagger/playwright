@@ -12,12 +12,52 @@ let range(n: Int!): [Int!]! {
   }
 }
 
+# workspacePath resolves a project path — cwd-relative, or absolute from the
+# workspace root — to a root-absolute path ("/" is the workspace root).
+let workspacePath(cwd: String!, p: String!): String! {
+  if (p.hasPrefix("/")) {
+    p
+  } else {
+    if (p == "" or p == ".") {
+      cwd
+    } else {
+      cwd.trimSuffix("/") + "/" + p
+    }
+  }
+}
+
+# installDirFor returns the directory holding the nearest package.json at or
+# above the project path, or null when the workspace has none.
+let installDirFor(ws: Workspace!, path: String!): String {
+  let pkg = ws.findUp("package.json", from: path)
+  if (pkg == null) {
+    null
+  } else {
+    let dir = pkg.trimSuffix("package.json").trimSuffix("/")
+    if (dir == "") { "/" } else { dir }
+  }
+}
+
 type Playwright {
   """
-  The Playwright project directory (contains playwright.config.*), discovered
-  from the workspace or chosen via sourcePath.
+  The workspace root directory.
   """
   pub source: Directory!
+
+  """
+  Root-absolute path of the Playwright project directory (contains
+  playwright.config.*) within the workspace — "/" is the workspace root.
+  Discovered from the client's working directory or chosen via sourcePath.
+  """
+  pub path: String!
+
+  """
+  Root-absolute path of the directory holding the nearest package.json at or
+  above the project — where dependencies are installed. Null when the
+  workspace has none: the install is skipped and npx fetches Playwright on
+  demand.
+  """
+  pub installDir: String
 
   """
   Base container override. When null, the image is derived from the project's
@@ -40,8 +80,9 @@ type Playwright {
   new(
     ws: Workspace!,
     """
-    Workspace path of the Playwright project. Empty (default) discovers the
-    directory containing playwright.config.* — required when the workspace
+    Path of the Playwright project, relative to the client's working directory
+    (absolute paths resolve from the workspace root). Empty (default) discovers
+    the directory containing playwright.config.* — required when the workspace
     holds more than one Playwright project.
     """
     sourcePath: String! = "",
@@ -91,8 +132,9 @@ type Playwright {
     shards: Int! = 1,
   ) {
     if (sourcePath != "") {
-      self.source = ws.directory(sourcePath, exclude: ["node_modules"])
+      self.path = workspacePath(ws.cwd, sourcePath)
     } else {
+      # Discovery searches at or below the client's working directory.
       let matches = ws.directory(".", include: ["**/playwright.config.*"]).glob("**/playwright.config.*")
       # Ignore configs inside hidden directories (editor state, stale worktrees).
       let visible = matches.filter { m => !m.hasPrefix(".") and !m.contains("/.") }
@@ -109,12 +151,11 @@ type Playwright {
         # parent dir of the config: trim the filename (last path segment)
         let filename = first.split("/").reduce("") { acc, part => part }
         let projectDir = first.trimSuffix(filename).trimSuffix("/")
-        self.source = ws.directory(
-          if (projectDir == "") { "." } else { projectDir },
-          exclude: ["node_modules"],
-        )
+        self.path = workspacePath(ws.cwd, projectDir)
       }
     }
+    self.source = ws.directory("/", exclude: ["**/node_modules"])
+    self.installDir = installDirFor(ws, self.path)
     self.baseCtr = baseCtr
     self.service = service
     self.serviceHostname = serviceHostname
@@ -126,11 +167,18 @@ type Playwright {
     self
   }
 
+  # The directory whose package.json / lockfile declare the Playwright
+  # dependency — the install root when one exists, else the project.
+  let pkgRoot: Directory! {
+    let dir = installDir
+    if (dir == null) { source.directory(path) } else { source.directory(dir) }
+  }
+
   # The @playwright/test version actually installed per package-lock.json,
   # or null when there is no lockfile entry.
   let lockedVersion: String {
-    let lock = if (source.exists("package-lock.json")) {
-      source.file("package-lock.json").contents
+    let lock = if (pkgRoot.exists("package-lock.json")) {
+      pkgRoot.file("package-lock.json").contents
     } else {
       ""
     }
@@ -150,8 +198,8 @@ type Playwright {
   # Image derived from the version range declared in package.json,
   # falling back to the module's pinned default.
   let declaredImage: String! {
-    let pkg = if (source.exists("package.json")) {
-      source.file("package.json").contents
+    let pkg = if (pkgRoot.exists("package.json")) {
+      pkgRoot.file("package.json").contents
     } else {
       ""
     }
@@ -213,7 +261,8 @@ type Playwright {
   }
 
   """
-  A container with the project mounted at /app and dependencies installed.
+  A container with the workspace mounted at /app, the project directory as
+  the working directory, and dependencies installed.
   When a service is bound, PLAYWRIGHT_BASE_URL points at it — your
   playwright.config should consume it:
     use: { baseURL: process.env.PLAYWRIGHT_BASE_URL || "http://localhost:3000" }
@@ -228,7 +277,7 @@ type Playwright {
       .withEnvVariable("PNPM_HOME", "/root/.packages")
       .withEnvVariable("BUN_INSTALL_CACHE_DIR", "/root/.packages")
       .withDirectory("/app", source)
-      .withWorkdir("/app")
+      .withWorkdir("/app" + path)
       .withEnvVariable("CI", "true")
     # yarn and pnpm ship via corepack on Node-based images
     let withPm = if (packageManager == "yarn" or packageManager == "pnpm") {
@@ -236,7 +285,15 @@ type Playwright {
     } else {
       prepared
     }
-    let installed = withPm.withExec([packageManager, "install"])
+    let dir = installDir
+    let installed = if (dir == null) {
+      withPm
+    } else {
+      withPm.
+        withWorkdir("/app" + dir).
+        withExec([packageManager, "install"]).
+        withWorkdir("/app" + path)
+    }
     let svc = service
     if (svc == null) {
       installed

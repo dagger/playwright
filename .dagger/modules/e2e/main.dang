@@ -1,0 +1,18 @@
+"""
+End-to-end checks for the playwright toolchain.
+"""
+type E2e {
+  """
+  Run the toolchain's test suite against the in-repo fixture project,
+  exercising service wiring, the localhost secure-context proxy, and
+  sharding.
+  """
+  pub checkFixture(ws: Workspace!): Void @check {
+    playwright(
+      ws,
+      service: fixtures.server,
+      localhostProxy: true,
+      shards: 2,
+    ).test
+  }
+}
