@@ -3,6 +3,16 @@ pub description = "Run Playwright browser tests against your project, with works
 # Fallback image when the project's @playwright/test version can't be derived.
 let fallbackImage = "mcr.microsoft.com/playwright:v1.58.2-noble"
 
+# Basenames that mark a Playwright project directory.
+let configNames: [String!]! = [
+  "playwright.config.ts",
+  "playwright.config.js",
+  "playwright.config.mjs",
+  "playwright.config.cjs",
+  "playwright.config.mts",
+  "playwright.config.cts",
+]
+
 # range returns [1, 2, ..., n]
 let range(n: Int!): [Int!]! {
   if (n <= 0) {
@@ -12,54 +22,72 @@ let range(n: Int!): [Int!]! {
   }
 }
 
-# workspacePath resolves a project path — cwd-relative, or absolute from the
-# workspace root — to a root-absolute path ("/" is the workspace root).
-let workspacePath(cwd: String!, p: String!): String! {
-  if (p.hasPrefix("/")) {
-    p
-  } else if (p == "" or p == ".") {
-    cwd
-  } else {
-    cwd.trimSuffix("/") + "/" + p
+# sorted orders strings bytewise, so keys (and their cache keys) are stable.
+let sorted(items: [String!]!): [String!]! {
+  let empty: [String!]! = []
+  items.reduce(empty) { acc, item =>
+    acc.takeWhile { x => x <= item } + [item] + acc.dropWhile { x => x <= item }
   }
 }
 
-# installDirFor returns the directory holding the nearest package.json at or
-# above the project path, or null when the workspace has none.
-let installDirFor(ws: Workspace!, path: String!): String {
-  let pkg = ws.findUp("package.json", from: path)
-  if (pkg == null) {
-    null
+# rootPath resolves a path — cwd-relative, or absolute from the workspace
+# root — to a workspace-root-relative path ("." is the workspace root).
+let rootPath(cwd: String!, p: String!): String! {
+  let start = if (p.hasPrefix("/")) {
+    [] :: [String!]!
   } else {
-    let dir = pkg.trimSuffix("package.json").trimSuffix("/")
-    if (dir == "") { "/" } else { dir }
+    cwd.split("/").filter { s => s != "" and s != "." }
   }
+  let segments = p.split("/").reduce(start) { acc, seg =>
+    if (seg == "" or seg == ".") {
+      acc
+    } else if (seg == "..") {
+      acc.dropLast(1)
+    } else {
+      acc + [seg]
+    }
+  }
+  if (segments.length == 0) { "." } else { segments.join("/") }
 }
 
+# wsPath turns a root-relative path into the absolute form the Workspace API
+# resolves from the workspace root.
+let wsPath(p: String!): String! {
+  if (p == ".") { "/" } else { "/" + p }
+}
+
+# appPath is where a root-relative path lives inside the test container.
+let appPath(p: String!): String! {
+  if (p == ".") { "/app" } else { "/app/" + p }
+}
+
+# dirOf returns the root-relative directory of an absolute workspace path
+# returned by findUp ("/fixture/package.json" → "fixture").
+let dirOf(found: String!): String! {
+  let dir = found.trimPrefix("/").split("/").dropLast(1).join("/")
+  if (dir == "") { "." } else { dir }
+}
+
+# depth counts a root-relative path's segments; the root "." has none.
+let depth(p: String!): Int! {
+  if (p == ".") { 0 } else { p.split("/").length }
+}
+
+# visible rejects a cwd-relative discovery result that sits inside
+# node_modules or a hidden directory (editor state, stale worktrees).
+let visible(cwdPath: String!): Boolean! {
+  cwdPath.split("/").any { seg =>
+    seg != "." and seg != ".." and (seg.hasPrefix(".") or seg == "node_modules")
+  } == false
+}
+
+"""
+Run Playwright browser tests against the projects in a workspace.
+"""
 type Playwright {
   """
-  The workspace root directory.
-  """
-  source: Directory!
-
-  """
-  Root-absolute path of the Playwright project directory (contains
-  playwright.config.*) within the workspace — "/" is the workspace root.
-  Discovered from the client's working directory or chosen via sourcePath.
-  """
-  path: String!
-
-  """
-  Root-absolute path of the directory holding the nearest package.json at or
-  above the project — where dependencies are installed. Null when the
-  workspace has none: the install is skipped and npx fetches Playwright on
-  demand.
-  """
-  installDir: String
-
-  """
-  Base container override. When null, the image is derived from the project's
-  @playwright/test version.
+  Base container override. When null, the image is derived from each
+  project's @playwright/test version.
   """
   baseCtr: Container
 
@@ -68,22 +96,37 @@ type Playwright {
   """
   service: Service
 
+  """
+  Hostname the service is bound as inside the test container.
+  """
   serviceHostname: String!
+
+  """
+  Playwright image to run tests in. Empty derives it per project.
+  """
   baseImageAddress: String!
+
+  """
+  Package manager used to install dependencies.
+  """
   packageManager: String!
+
+  """
+  Whether localhost:<port> is proxied to the bound service.
+  """
   localhostProxy: Boolean!
+
+  """
+  Extra arguments passed to every `playwright test` invocation.
+  """
   args: [String!]!
+
+  """
+  Number of parallel shards each project's tests run in.
+  """
   shards: Int!
 
   new(
-    ws: Workspace!,
-    """
-    Path of the Playwright project, relative to the client's working directory
-    (absolute paths resolve from the workspace root). Empty (default) discovers
-    the directory containing playwright.config.* — required when the workspace
-    holds more than one Playwright project.
-    """
-    sourcePath: String! = "",
     """
     Base container to use instead of the derived Playwright image
     (wireable: settings.baseCtr = "<module>:<function>" for any Container-returning function).
@@ -103,12 +146,12 @@ type Playwright {
     serviceHostname: String! = "frontend",
     """
     Playwright image to run tests in. Empty (default) derives
-    mcr.microsoft.com/playwright:v<version>-noble from the project's
+    mcr.microsoft.com/playwright:v<version>-noble from each project's
     @playwright/test dependency. The image's browsers must match that version.
     """
     baseImageAddress: String! = "",
     """
-    Package manager used to install the project's dependencies (npm, yarn, pnpm, bun).
+    Package manager used to install dependencies (npm, yarn, pnpm, bun).
     """
     packageManager: String! = "npm",
     """
@@ -124,36 +167,10 @@ type Playwright {
     """
     args: [String!]! = [],
     """
-    Default number of parallel test shards for `test` — set this to shard
-    the `playwright:test` check.
+    Number of parallel test shards each project's tests run in.
     """
     shards: Int! = 1,
   ) {
-    if (sourcePath != "") {
-      self.path = workspacePath(ws.cwd, sourcePath)
-    } else {
-      # Discovery searches at or below the client's working directory.
-      let matches = ws.directory(".", include: ["**/playwright.config.*"]).glob("**/playwright.config.*")
-      # Ignore configs inside hidden directories (editor state, stale worktrees).
-      let visible = matches.filter { m => !m.hasPrefix(".") and !m.contains("/.") }
-      if (visible.isEmpty) {
-        raise "no playwright.config.* found in workspace; set sourcePath to your Playwright project"
-      }
-      if (visible.length > 1) {
-        raise `multiple Playwright projects found (${visible.join(", ")}); set sourcePath to choose one`
-      }
-      let first = visible[0]
-      if (first == null) {
-        raise "no playwright.config.* found in workspace"
-      } else {
-        # parent dir of the config: trim the filename (last path segment)
-        let filename = first.split("/").reduce("") { acc, part => part }
-        let projectDir = first.trimSuffix(filename).trimSuffix("/")
-        self.path = workspacePath(ws.cwd, projectDir)
-      }
-    }
-    self.source = ws.directory("/", exclude: ["**/node_modules"])
-    self.installDir = installDirFor(ws, self.path)
     self.baseCtr = baseCtr
     self.service = service
     self.serviceHostname = serviceHostname
@@ -165,18 +182,129 @@ type Playwright {
     self
   }
 
-  # The directory whose package.json / lockfile declare the Playwright
-  # dependency — the install root when one exists, else the project.
-  let pkgRoot: Directory! {
-    let dir = installDir
-    if (dir == null) { source.directory(path) } else { source.directory(dir) }
+  """
+  Playwright projects at or below the working directory, keyed by config directory.
+  """
+  projects(ws: Workspace!): PlaywrightProjects! {
+    # Answered from the workspace tree alone, so listing never runs a container.
+    let found = ws
+      .findRoots(markers: configNames, exclude: ["**/node_modules", "**/.*"])
+      .filter { p => visible(p) }
+      .map { p => rootPath(ws.cwd, p) }
+      .uniq
+    PlaywrightProjects(paths: sorted(found), tool: self)
+  }
+
+  """
+  The Playwright project containing a workspace path.
+  """
+  project(
+    ws: Workspace!,
+    """
+    A directory at or below the project's playwright.config, relative to the
+    working directory (absolute paths resolve from the workspace root).
+    """
+    path: String!,
+  ): PlaywrightProject! {
+    let from = wsPath(rootPath(ws.cwd, path))
+    # The nearest config at or above the path wins, whatever its extension.
+    let empty: [String!]! = []
+    let dirs = configNames.reduce(empty) { acc, name =>
+      let found = ws.findUp(name, from: from)
+      if (found == null) { acc } else { acc + [dirOf(found)] }
+    }
+    let nearest = dirs.reduce("") { best, dir =>
+      if (best == "" or depth(dir) > depth(best)) { dir } else { best }
+    }
+    if (nearest == "") {
+      raise "no playwright.config.* found at or above " + path
+    }
+    projectAt(nearest)
+  }
+
+  let projectAt(path: String!): PlaywrightProject! {
+    PlaywrightProject(path: path, tool: self)
+  }
+}
+
+"""
+Playwright projects in a workspace, keyed by config directory.
+"""
+type PlaywrightProjects @collection {
+  """
+  Directories holding a playwright.config, relative to the workspace root.
+  """
+  paths: [String!]! @keys
+
+  """
+  Settings every project runs with.
+  """
+  let tool: Playwright!
+
+  """
+  The Playwright project whose config is in path.
+  """
+  project(path: String!): PlaywrightProject! @get {
+    tool.projectAt(path)
+  }
+
+  """
+  Run Playwright tests in the selected projects.
+  """
+  test(ws: Workspace!): Void @check {
+    # A selection over a list evaluates its elements concurrently, so every
+    # project (and each project's shards) runs in parallel.
+    let failures = paths.map { p => project(p) }.{{path, failure: testFailure(ws)}}
+      .filter { result => result.failure != null }
+    if (failures.length > 0) {
+      raise "Playwright tests failed:\n" + failures.map { result =>
+        "- " + result.path + ": " + (result.failure ?? "")
+      }.join("\n")
+    }
+    null
+  }
+}
+
+"""
+A Playwright project: a directory holding a playwright.config.
+"""
+type PlaywrightProject {
+  """
+  Directory holding the playwright.config, relative to the workspace root.
+  """
+  path: String!
+
+  """
+  Settings this project runs with.
+  """
+  let tool: Playwright!
+
+  """
+  Directory holding the nearest package.json at or above the project,
+  relative to the workspace root — where dependencies are installed. Null
+  when there is none: the install is skipped and npx fetches Playwright on
+  demand.
+  """
+  installDir(ws: Workspace!): String {
+    let pkg = ws.findUp("package.json", from: wsPath(path))
+    if (pkg == null) { null } else { dirOf(pkg) }
+  }
+
+  # The package.json / lockfile that declare the Playwright dependency: the
+  # install root's when one exists, else the project's.
+  let pkgRoot(ws: Workspace!): Directory! {
+    ws.directory(
+      wsPath(installDir(ws) ?? path),
+      include: ["package.json", "package-lock.json"],
+    )
   }
 
   # The @playwright/test version actually installed per package-lock.json,
   # or null when there is no lockfile entry.
-  let lockedVersion: String {
-    let lock = if (pkgRoot.exists("package-lock.json")) {
-      pkgRoot.file("package-lock.json").contents
+  let lockedVersion(ws: Workspace!): String {
+    let root = pkgRoot(ws)
+    let lock = if (root.exists("package-lock.json")) {
+      root.file("package-lock.json").contents
     } else {
       ""
     }
@@ -195,9 +323,10 @@ type Playwright {
 
   # Image derived from the version range declared in package.json,
   # falling back to the module's pinned default.
-  let declaredImage: String! {
-    let pkg = if (pkgRoot.exists("package.json")) {
-      pkgRoot.file("package.json").contents
+  let declaredImage(ws: Workspace!): String! {
+    let root = pkgRoot(ws)
+    let pkg = if (root.exists("package.json")) {
+      root.file("package.json").contents
     } else {
       ""
     }
@@ -221,20 +350,17 @@ type Playwright {
   }
 
   """
-  The resolved Playwright image address: the explicit baseImageAddress when
-  set; else derived from the @playwright/test version installed per the
-  project's lockfile; else from the version declared in package.json; else
-  the module's pinned fallback.
+  The Playwright image this project's tests run in.
   """
-  imageAddress: String! {
-    if (baseImageAddress != "") {
-      baseImageAddress
+  imageAddress(ws: Workspace!): String! {
+    if (tool.baseImageAddress != "") {
+      tool.baseImageAddress
     } else {
-      let locked = lockedVersion
+      let locked = lockedVersion(ws)
       if (locked == null) {
-        declaredImage
+        declaredImage(ws)
       } else if (locked == "") {
-        declaredImage
+        declaredImage(ws)
       } else {
         `mcr.microsoft.com/playwright:v${locked}-noble`
       }
@@ -243,7 +369,7 @@ type Playwright {
 
   # servicePort is the first exposed port of the bound service
   let servicePort: Int! {
-    let svc = service
+    let svc = tool.service
     if (svc == null) {
       raise "no service bound"
     } else {
@@ -257,49 +383,44 @@ type Playwright {
   }
 
   """
-  A container with the workspace mounted at /app, the project directory as
-  the working directory, and dependencies installed.
-  When a service is bound, PLAYWRIGHT_BASE_URL points at it — your
-  playwright.config should consume it:
-    use: { baseURL: process.env.PLAYWRIGHT_BASE_URL || "http://localhost:3000" }
-  With localhostProxy, PLAYWRIGHT_LOCALHOST_BASE_URL is also set.
+  The test container: workspace mounted, dependencies installed, service bound.
   """
-  base: Container! {
-    let ctr = if (baseCtr != null) { baseCtr } else {
-      container.from(imageAddress)
-    }
+  base(ws: Workspace!): Container! {
+    let ctr = tool.baseCtr ?? container.from(imageAddress(ws))
+    let pm = tool.packageManager
     let prepared = ctr
       .withMountedCache("/root/.packages", cacheVolume("playwright-packages"))
       .withEnvVariable("npm_config_cache", "/root/.packages")
       .withEnvVariable("YARN_CACHE_FOLDER", "/root/.packages")
       .withEnvVariable("PNPM_HOME", "/root/.packages")
       .withEnvVariable("BUN_INSTALL_CACHE_DIR", "/root/.packages")
-      .withDirectory("/app", source)
-      .withWorkdir("/app" + path)
+      .withDirectory("/app", ws.directory("/", exclude: ["**/node_modules"]))
+      .withWorkdir(appPath(path))
       .withEnvVariable("CI", "true")
     # yarn and pnpm ship via corepack on Node-based images
-    let withPm = if (packageManager == "yarn" or packageManager == "pnpm") {
+    let withPm = if (pm == "yarn" or pm == "pnpm") {
       prepared.withExec(["corepack", "enable"])
     } else {
       prepared
     }
-    let dir = installDir
+    let dir = installDir(ws)
     let installed = if (dir == null) {
       withPm
     } else {
       withPm
-        .withWorkdir("/app" + dir)
-        .withExec([packageManager, "install"])
-        .withWorkdir("/app" + path)
+        .withWorkdir(appPath(dir))
+        .withExec([pm, "install"])
+        .withWorkdir(appPath(path))
     }
-    let svc = service
+    let svc = tool.service
     if (svc == null) {
       installed
     } else {
+      let host = tool.serviceHostname
       let bound = installed
-        .withServiceBinding(serviceHostname, svc)
-        .withEnvVariable("PLAYWRIGHT_BASE_URL", `http://${serviceHostname}:${servicePort}`)
-      if (localhostProxy) {
+        .withServiceBinding(host, svc)
+        .withEnvVariable("PLAYWRIGHT_BASE_URL", `http://${host}:${servicePort}`)
+      if (tool.localhostProxy) {
         bound
           .withExec(["apt-get", "update", "-qq"])
           .withExec(["apt-get", "install", "-y", "-qq", "socat"])
@@ -313,33 +434,46 @@ type Playwright {
   # testCommand builds the exec for one shard, wrapping in a socat localhost
   # proxy when enabled.
   let testCommand(shard: String!): [String!]! {
-    let testArgs = ["npx", "playwright", "test"] + args + [`--shard=${shard}`]
-    if (localhostProxy and service != null) {
+    let testArgs = ["npx", "playwright", "test"] + tool.args + [`--shard=${shard}`]
+    if (tool.localhostProxy and tool.service != null) {
       # Background socat so localhost:<port> reaches the service during the run.
-      ["sh", "-c", `socat TCP-LISTEN:${servicePort},fork,reuseaddr TCP:${serviceHostname}:${servicePort} & exec ${testArgs.join(" ")}`]
+      let host = tool.serviceHostname
+      ["sh", "-c", `socat TCP-LISTEN:${servicePort},fork,reuseaddr TCP:${host}:${servicePort} & exec ${testArgs.join(" ")}`]
     } else {
       testArgs
     }
   }
 
   """
-  Run the Playwright test suite, sharded across `shards` parallel containers.
+  Run this project's Playwright tests.
   """
-  test: Void @check {
-    let b = base
-    let runs = range(shards).map { i => b.withExec(testCommand(`${i}/${shards}`)) }
-    # {{ }} forces every shard concurrently, failing fast on the first error
-    runs.{{out: stdout}}
+  test(ws: Workspace!): Void @check {
+    let failure = testFailure(ws)
+    if (failure != null) {
+      raise "Playwright project " + path + ": " + failure
+    }
     null
   }
 
+  # Error message from running this project's shards, or null when they pass.
+  let testFailure(ws: Workspace!): String {
+    {
+      let b = base(ws)
+      let n = tool.shards
+      let runs = range(n).map { i => b.withExec(testCommand(`${i}/${n}`)) }
+      # {{ }} forces every shard concurrently, failing fast on the first error
+      runs.{{out: stdout}}
+      null
+    } rescue {
+      err: Error => err.message
+    }
+  }
+
   """
-  Run the suite tolerating failures and return the HTML report directory
-  (reporter: 'html' must be configured). Single-run — shard report merging is
-  not yet supported.
+  HTML report from running this project's tests, tolerating failures.
   """
-  report: Directory! {
-    base
+  report(ws: Workspace!): Directory! {
+    base(ws)
       .withExec(testCommand("1/1"), expect: ReturnType.ANY)
       .directory("playwright-report")
   }

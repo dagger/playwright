@@ -1,18 +1,205 @@
 """
 End-to-end checks for the playwright toolchain.
+
+The in-repo fixture holds two projects: `fixture` (served by the fixtures
+module's static server) and `fixture/nested` (self-contained, no package.json
+of its own).
 """
 type E2e {
+  let assert(condition: Boolean!, message: String!): Void {
+    if (condition == false) { raise message }
+    null
+  }
+
   """
-  Run the toolchain's test suite against the in-repo fixture project,
-  exercising service wiring, the localhost secure-context proxy, and
-  sharding.
+  Run a check, raising its failure. A check called through a dependency comes
+  back as a Check that has not run.
+  """
+  let run(check: Check!): Void {
+    # Check.error is not null for a passing check when read from Dang, so ask
+    # pass first and read the message only on failure.
+    if (check.pass == false) {
+      raise check.error.message ?? "check failed"
+    }
+    null
+  }
+
+  # The workspace with its working directory at the root, so keys and lookups
+  # don't depend on where `dagger check` was invoked.
+  let root(ws: Workspace!): Workspace! { ws.withWorkdir(".") }
+
+  # The toolchain as the fixture project needs it: the fixture server wired
+  # in, the localhost proxy on, and two shards.
+  let wired: Playwright! {
+    playwright(service: fixtures.server, localhostProxy: true, shards: 2)
+  }
+
+  """
+  Run the fixture project with a bound service, the localhost proxy and two shards.
   """
   checkFixture(ws: Workspace!): Void @check {
-    playwright(
-      ws,
-      service: fixtures.server,
-      localhostProxy: true,
-      shards: 2,
-    ).test
+    let w = root(ws)
+    let project = wired.projects(w).get(key: "fixture")
+    let ctr = project.base(w)
+    assert(
+      ctr.envVariable("PLAYWRIGHT_BASE_URL") == "http://frontend:8080",
+      "PLAYWRIGHT_BASE_URL does not point at the bound service",
+    )
+    assert(
+      ctr.envVariable("PLAYWRIGHT_LOCALHOST_BASE_URL") == "http://localhost:8080",
+      "PLAYWRIGHT_LOCALHOST_BASE_URL is not set",
+    )
+    run(project.test(w))
+    null
+  }
+
+  """
+  Discovery keys projects by config directory from any working directory.
+  """
+  discoveryCheck(ws: Workspace!): Void @check {
+    let w = root(ws)
+    let keys = playwright.projects(w).keys.join(",")
+    assert(keys == "fixture,fixture/nested", "unexpected keys from the root: " + keys)
+
+    let synthetic = w
+      .withNewFile("synthetic/b/playwright.config.mjs", "")
+      .withNewFile("synthetic/a/playwright.config.cts", "")
+      .withNewFile("synthetic/a/playwright.config.ts", "")
+      .withNewFile("fixture/node_modules/dep/playwright.config.js", "")
+      .withNewFile("fixture/.cache/playwright.config.ts", "")
+    let all = playwright.projects(synthetic).keys.join(",")
+    assert(
+      all == "fixture,fixture/nested,synthetic/a,synthetic/b",
+      "unexpected keys in a synthetic workspace: " + all,
+    )
+
+    let below = playwright.projects(w.withWorkdir("fixture")).keys.join(",")
+    assert(below == "fixture,fixture/nested", "unexpected keys from fixture: " + below)
+    let nested = playwright.projects(w.withWorkdir("fixture/nested")).keys.join(",")
+    assert(nested == "fixture/nested", "discovery from a project escaped its subtree: " + nested)
+    let inside = playwright.projects(w.withWorkdir("fixture/tests")).keys.join(",")
+    assert(inside == "fixture", "discovery inside a project missed its enclosing config: " + inside)
+    null
+  }
+
+  """
+  The project lookup resolves the project containing a path.
+  """
+  lookupCheck(ws: Workspace!): Void @check {
+    let w = root(ws)
+    assert(playwright.project(w, "fixture/tests").path == "fixture", "lookup missed the enclosing project")
+    assert(playwright.project(w, "fixture/nested").path == "fixture/nested", "lookup missed the nearest project")
+    assert(
+      playwright.project(w.withWorkdir("fixture"), "nested").path == "fixture/nested",
+      "lookup did not resolve relative to the working directory",
+    )
+    assert(
+      playwright.project(w.withWorkdir("fixture/nested"), "/fixture").path == "fixture",
+      "lookup did not resolve an absolute path from the workspace root",
+    )
+    let missing = {
+      playwright.project(w, ".").path
+    } rescue {
+      err: Error => err.message
+    }
+    assert(missing.contains("no playwright.config"), "missing project did not fail clearly: " + missing)
+    null
+  }
+
+  """
+  Dependencies install from the nearest package.json, which also picks the image.
+  """
+  installCheck(ws: Workspace!): Void @check {
+    let w = root(ws)
+    let projects = playwright.projects(w)
+    let image = "mcr.microsoft.com/playwright:v1.58.2-noble"
+    assert(projects.get(key: "fixture").installDir(w) == "fixture", "fixture installs elsewhere")
+    assert(
+      projects.get(key: "fixture/nested").installDir(w) == "fixture",
+      "nested project does not install from the enclosing package.json",
+    )
+    assert(projects.get(key: "fixture/nested").imageAddress(w) == image, "nested image not derived")
+    let bare = w.withNewFile("synthetic/playwright.config.ts", "")
+    assert(
+      playwright.projects(bare).get(key: "synthetic").installDir(bare) == null,
+      "invented an install dir",
+    )
+    assert(
+      playwright(baseImageAddress: "example.com/pw:1").project(w, "fixture").imageAddress(w) == "example.com/pw:1",
+      "baseImageAddress was not honored",
+    )
+    null
+  }
+
+  """
+  The projects collection supports get, subset and subset batches.
+  """
+  collectionCheck(ws: Workspace!): Void @check {
+    let w = root(ws)
+    # Unwired: `fixture` needs the server and fails, `fixture/nested` doesn't.
+    let projects = playwright.projects(w)
+    let only = projects.subset(keys: ["fixture/nested"])
+    assert(only.keys.join(",") == "fixture/nested", "subset kept other keys")
+    assert(only.get(key: "fixture/nested").path == "fixture/nested", "get inside a subset failed")
+    let outside = {
+      only.get(key: "fixture").path
+    } rescue {
+      err: Error => "rejected"
+    }
+    assert(outside == "rejected", "get outside a subset succeeded")
+    let unknown = {
+      projects.subset(keys: ["nope"]).keys.join(",")
+    } rescue {
+      err: Error => "rejected"
+    }
+    assert(unknown == "rejected", "subset accepted an unknown key")
+    let duplicate = {
+      projects.subset(keys: ["fixture", "fixture"]).keys.join(",")
+    } rescue {
+      err: Error => "rejected"
+    }
+    assert(duplicate == "rejected", "subset accepted a duplicate key")
+    let empty: [String!]! = []
+    assert(projects.subset(keys: empty).keys.length == 0, "empty subset is not empty")
+
+    # The failing project is outside the subset, so this passes only if the
+    # batch ran just its own keys.
+    run(only.batch.test(w))
+
+    # The whole collection reports the failing project, and only it.
+    let failure = {
+      run(projects.batch.test(w))
+      "unexpected success"
+    } rescue {
+      err: Error => err.message
+    }
+    assert(failure.contains("- fixture:"), "batch did not report the failing project: " + failure)
+    assert(failure.contains("- fixture/nested:") == false, "batch reported a passing project: " + failure)
+
+    # With every project failing, the batch reports all of them.
+    let both = {
+      run(
+        playwright(args: ["--bogus-option"]).projects(w).batch.test(w),
+      )
+      "unexpected success"
+    } rescue {
+      err: Error => err.message
+    }
+    assert(
+      both.contains("- fixture:") and both.contains("- fixture/nested:"),
+      "batch did not report every failing project: " + both,
+    )
+    null
+  }
+
+  """
+  The batch tests every project against the wired service, and report works.
+  """
+  batchCheck(ws: Workspace!): Void @check {
+    let w = root(ws)
+    run(wired.projects(w).batch.test(w))
+    let report = playwright.project(w, "fixture").report(w)
+    assert(report.entries.contains("index.html"), "report has no index.html")
+    null
   }
 }
