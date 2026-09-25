@@ -21,7 +21,3 @@ name = "playwright"
 
 [sdks.dang.scopes.".dagger/modules/fixtures"]
 is-module = true
-
-[sdks.dang.scopes.".dagger/modules/e2e"]
-clients = ["./.", "./.dagger/modules/fixtures"]
-is-module = true
