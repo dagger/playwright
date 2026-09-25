@@ -17,12 +17,10 @@ let range(n: Int!): [Int!]! {
 let workspacePath(cwd: String!, p: String!): String! {
   if (p.hasPrefix("/")) {
     p
+  } else if (p == "" or p == ".") {
+    cwd
   } else {
-    if (p == "" or p == ".") {
-      cwd
-    } else {
-      cwd.trimSuffix("/") + "/" + p
-    }
+    cwd.trimSuffix("/") + "/" + p
   }
 }
 
@@ -42,14 +40,14 @@ type Playwright {
   """
   The workspace root directory.
   """
-  pub source: Directory!
+  source: Directory!
 
   """
   Root-absolute path of the Playwright project directory (contains
   playwright.config.*) within the workspace — "/" is the workspace root.
   Discovered from the client's working directory or chosen via sourcePath.
   """
-  pub path: String!
+  path: String!
 
   """
   Root-absolute path of the directory holding the nearest package.json at or
@@ -57,25 +55,25 @@ type Playwright {
   workspace has none: the install is skipped and npx fetches Playwright on
   demand.
   """
-  pub installDir: String
+  installDir: String
 
   """
   Base container override. When null, the image is derived from the project's
   @playwright/test version.
   """
-  pub baseCtr: Container
+  baseCtr: Container
 
   """
   Service under test, bound into the test container as `serviceHostname`.
   """
-  pub service: Service
+  service: Service
 
-  pub serviceHostname: String!
-  pub baseImageAddress: String!
-  pub packageManager: String!
-  pub localhostProxy: Boolean!
-  pub args: [String!]!
-  pub shards: Int!
+  serviceHostname: String!
+  baseImageAddress: String!
+  packageManager: String!
+  localhostProxy: Boolean!
+  args: [String!]!
+  shards: Int!
 
   new(
     ws: Workspace!,
@@ -228,19 +226,17 @@ type Playwright {
   project's lockfile; else from the version declared in package.json; else
   the module's pinned fallback.
   """
-  pub imageAddress: String! {
+  imageAddress: String! {
     if (baseImageAddress != "") {
       baseImageAddress
     } else {
       let locked = lockedVersion
       if (locked == null) {
         declaredImage
+      } else if (locked == "") {
+        declaredImage
       } else {
-        if (locked == "") {
-          declaredImage
-        } else {
-          `mcr.microsoft.com/playwright:v${locked}-noble`
-        }
+        `mcr.microsoft.com/playwright:v${locked}-noble`
       }
     }
   }
@@ -251,7 +247,7 @@ type Playwright {
     if (svc == null) {
       raise "no service bound"
     } else {
-      let first = svc.ports.{{ port }}[0]
+      let first = svc.ports.{{port}}[0]
       if (first == null) {
         raise "service has no exposed ports"
       } else {
@@ -268,8 +264,10 @@ type Playwright {
     use: { baseURL: process.env.PLAYWRIGHT_BASE_URL || "http://localhost:3000" }
   With localhostProxy, PLAYWRIGHT_LOCALHOST_BASE_URL is also set.
   """
-  pub base: Container! {
-    let ctr = if (baseCtr != null) { baseCtr } else { container.from(imageAddress) }
+  base: Container! {
+    let ctr = if (baseCtr != null) { baseCtr } else {
+      container.from(imageAddress)
+    }
     let prepared = ctr
       .withMountedCache("/root/.packages", cacheVolume("playwright-packages"))
       .withEnvVariable("npm_config_cache", "/root/.packages")
@@ -289,10 +287,10 @@ type Playwright {
     let installed = if (dir == null) {
       withPm
     } else {
-      withPm.
-        withWorkdir("/app" + dir).
-        withExec([packageManager, "install"]).
-        withWorkdir("/app" + path)
+      withPm
+        .withWorkdir("/app" + dir)
+        .withExec([packageManager, "install"])
+        .withWorkdir("/app" + path)
     }
     let svc = service
     if (svc == null) {
@@ -327,11 +325,11 @@ type Playwright {
   """
   Run the Playwright test suite, sharded across `shards` parallel containers.
   """
-  pub test: Void @check {
+  test: Void @check {
     let b = base
     let runs = range(shards).map { i => b.withExec(testCommand(`${i}/${shards}`)) }
     # {{ }} forces every shard concurrently, failing fast on the first error
-    runs.{{ out: stdout }}
+    runs.{{out: stdout}}
     null
   }
 
@@ -340,7 +338,7 @@ type Playwright {
   (reporter: 'html' must be configured). Single-run — shard report merging is
   not yet supported.
   """
-  pub report: Directory! {
+  report: Directory! {
     base
       .withExec(testCommand("1/1"), expect: ReturnType.ANY)
       .directory("playwright-report")

@@ -1,13 +1,13 @@
 name = "e2e"
-engineVersion = "v1.0.0-beta.6"
+engineVersion = "v1.0.0-beta.14"
 
 [runtime]
   source = "dang"
 
 [[dependencies]]
-  name = "playwright"
-  source = "../../.."
-
-[[dependencies]]
   name = "fixtures"
   source = "../fixtures"
+
+[[dependencies]]
+  name = "playwright"
+  source = "../../.."

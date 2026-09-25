@@ -7,7 +7,7 @@ type E2e {
   exercising service wiring, the localhost secure-context proxy, and
   sharding.
   """
-  pub checkFixture(ws: Workspace!): Void @check {
+  checkFixture(ws: Workspace!): Void @check {
     playwright(
       ws,
       service: fixtures.server,
