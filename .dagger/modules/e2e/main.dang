@@ -54,7 +54,7 @@ type E2e {
   }
 
   """
-  Discovery keys projects by config directory from any working directory.
+  Discovery keys projects by config directory, scoped by the working directory.
   """
   discoveryCheck(ws: Workspace!): Void @check {
     let w = root(ws)
@@ -73,12 +73,23 @@ type E2e {
       "unexpected keys in a synthetic workspace: " + all,
     )
 
-    let below = playwright.projects(w.withWorkdir("fixture")).keys.join(",")
-    assert(below == "fixture,fixture/nested", "unexpected keys from fixture: " + below)
+    # At a project root: that project and the ones below it, no ancestors.
+    let atRoot = playwright.projects(w.withWorkdir("fixture")).keys.join(",")
+    assert(atRoot == "fixture,fixture/nested", "unexpected keys from fixture: " + atRoot)
     let nested = playwright.projects(w.withWorkdir("fixture/nested")).keys.join(",")
     assert(nested == "fixture/nested", "discovery from a project escaped its subtree: " + nested)
+
+    # Inside a project's subdirectory: exactly the enclosing project.
     let inside = playwright.projects(w.withWorkdir("fixture/tests")).keys.join(",")
     assert(inside == "fixture", "discovery inside a project missed its enclosing config: " + inside)
+    let deeper = playwright.projects(w.withWorkdir("fixture/nested/tests")).keys.join(",")
+    assert(deeper == "fixture/nested", "discovery did not pick the nearest enclosing project: " + deeper)
+
+    # Outside any project: only the projects below.
+    let outside = playwright.projects(synthetic.withWorkdir("synthetic")).keys.join(",")
+    assert(outside == "synthetic/a,synthetic/b", "unexpected keys outside any project: " + outside)
+    let none = playwright.projects(w.withWorkdir(".dagger")).keys.length
+    assert(none == 0, "found projects where there are none")
     null
   }
 

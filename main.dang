@@ -73,14 +73,6 @@ let depth(p: String!): Int! {
   if (p == ".") { 0 } else { p.split("/").length }
 }
 
-# visible rejects a cwd-relative discovery result that sits inside
-# node_modules or a hidden directory (editor state, stale worktrees).
-let visible(cwdPath: String!): Boolean! {
-  cwdPath.split("/").any { seg =>
-    seg != "." and seg != ".." and (seg.hasPrefix(".") or seg == "node_modules")
-  } == false
-}
-
 """
 Run Playwright browser tests against the projects in a workspace.
 """
@@ -186,10 +178,12 @@ type Playwright {
   Playwright projects at or below the working directory, keyed by config directory.
   """
   projects(ws: Workspace!): PlaywrightProjects! {
-    # Answered from the workspace tree alone, so listing never runs a container.
+    # One findRoots walk answers this, so listing never runs a container. It
+    # returns every config directory at or below the cwd, plus the nearest
+    # enclosing one when the cwd is inside a project; the excludes prune
+    # node_modules and hidden directories from the walk itself.
     let found = ws
       .findRoots(markers: configNames, exclude: ["**/node_modules", "**/.*"])
-      .filter { p => visible(p) }
       .map { p => rootPath(ws.cwd, p) }
       .uniq
     PlaywrightProjects(paths: sorted(found), tool: self)

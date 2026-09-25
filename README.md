@@ -6,13 +6,15 @@ project, with first-class [workspace service
 wiring](https://docs.dagger.io/config/module-wiring): point it at any module
 function that returns a `Service` and your tests run against it.
 
-Requires Dagger engine `v1.0.0-beta.15` or later.
+Requires Dagger engine `v1.0.0-beta.15` or later. beta.15 is not released
+yet, so for now the module only loads on a dev engine; a released engine fails
+to load it.
 
 ## Functions
 
 | Function   | Description                                                      |
 | ---------- | ---------------------------------------------------------------- |
-| `projects` | Playwright projects in the workspace, as a collection keyed by config directory. |
+| `projects` | Playwright projects at or below the working directory, as a collection keyed by config directory. |
 | `project`  | The Playwright project containing a workspace path.              |
 
 On a project:
@@ -46,10 +48,11 @@ dagger check --playwright --test --playwright-project=apps/web   # same, as flag
 ## Projects
 
 Every directory holding a `playwright.config.{ts,js,mjs,cjs,mts,cts}` is a
-Playwright project, keyed by that directory relative to the workspace root
-(`.` for the root itself). `projects` is a collection, so it adds a
-`playwright-project` dimension to `dagger check`, `dagger list` and
-`dagger shell`:
+project, keyed by that directory relative to the workspace root (`.` for the
+root itself). These are directories, not the browser `projects` inside a
+config (`chromium`, `firefox`, …); pick those with `args`. `projects` is a
+collection, so it adds a `playwright-project` dimension to `dagger check`,
+`dagger list` and `dagger shell`:
 
 ```console
 $ dagger list playwright-projects -a                # every project's key
@@ -63,8 +66,18 @@ failing run lists every project that failed. `--test` alone also selects
 every other installed module's check named `test`; `--playwright` narrows it
 to this one. `dagger check --help` lists the flags in effect.
 
-Discovery reads the workspace tree only — listing projects runs no container.
-It skips `node_modules` and hidden directories.
+### Discovery
+
+Keys come from a single walk of the workspace for config file names
+(`Workspace.findRoots`), with `node_modules` and hidden directories pruned
+from the walk. Listing projects reads no file contents and runs no container
+or `npx`, so it stays fast in large monorepos. Because discovery is static:
+
+- a config is a project whether or not it is a real suite — a shared base
+  config named `playwright.config.ts` is listed too;
+- configs with other names (`playwright.ct.config.ts`, a custom `--config`
+  path) are not discovered;
+- configs inside `node_modules` or hidden directories are never listed.
 
 Other artifacts per project:
 
@@ -77,15 +90,25 @@ dagger api call playwright project --path=apps/web report export --path=./playwr
 
 ## Working directory awareness
 
-The module is aware of where in the workspace you invoke it: discovery
-finds projects at or below your current directory, plus the project
-enclosing it, so `cd apps/web && dagger check` (or
-`dagger -W ./apps/web check`) runs just that project. The `project` lookup
-takes a path relative to your current directory (absolute paths resolve from
-the workspace root) and returns the nearest project at or above it. The whole
-workspace is still mounted into the test container, with the project
-directory as the working directory, so configuration and dependencies that
-live above the project — monorepo roots, shared configs — keep resolving.
+Which projects are keys depends on where you run the command:
+
+- **inside a project's subdirectory** — just the nearest enclosing project;
+- **at a project's root** — that project and any projects below it;
+- **anywhere else** — the projects below your directory.
+
+So running from anywhere inside a project selects it with no flags:
+
+```console
+$ cd apps/web/src && dagger check        # runs apps/web only
+$ dagger check -l --all                  # from apps/web/src: lists apps/web only
+```
+
+The `project` lookup takes a path relative to your current directory
+(absolute paths resolve from the workspace root) and returns the nearest
+project at or above it. The whole workspace is still mounted into the test
+container, with the project directory as the working directory, so
+configuration and dependencies that live above the project — monorepo roots,
+shared configs — keep resolving.
 
 Dependencies are installed at the nearest `package.json` at or above the
 project, so a project without its own `package.json` installs from its
@@ -185,16 +208,46 @@ Two things to know about the test environment:
 shards = 4
 ```
 
-Shards run in parallel containers against the same wired service and fail fast
-on the first failing shard. (`report` is single-run; shard report merging is
-not yet supported.)
+A project's shards run in parallel containers against the same wired service
+and fail fast on the first failing shard. (`report` is single-run; shard
+report merging is not yet supported.)
+
+## Using it from another module
+
+From your own module, `projects(ws)` is the collection: `keys`, `get(key:)`,
+`subset(keys:)`, and `batch` for running a check over it. A check called
+through a dependency comes back as a `Check` that has not run, so wrap it:
+
+```dang
+type Ci {
+  let run(check: Check!): Void {
+    if (check.pass == false) {
+      raise check.error.message ?? "check failed"
+    }
+    null
+  }
+
+  e2e(ws: Workspace!): Void @check {
+    let projects = playwright(service: myapp.serve, shards: 2).projects(ws)
+    run(projects.batch.test(ws))                                  # every project
+    run(projects.subset(keys: ["apps/web"]).batch.test(ws))       # some
+    run(projects.get(key: "apps/web").test(ws))                   # one
+    null
+  }
+
+  webReport(ws: Workspace!): Directory! {
+    playwright.project(ws, "apps/web").report(ws)
+  }
+}
+```
 
 ## Development
 
-This repo is its own e2e fixture: `.dagger/modules/e2e` runs the toolchain
+This repo is its own e2e fixture: `.dagger/modules/e2e` runs the module
 against two minimal Playwright projects — `fixture/`, with
 `.dagger/modules/fixtures`' static server bound as the service under test, and
 `fixture/nested/`, which has no `package.json` of its own and installs from
-the enclosing one. `dagger check` exercises discovery, lookups, the projects
+the enclosing one. `dagger check` exercises discovery (including
+working-directory scoping), lookups, the projects
 collection (keys, `get`, `subset`, batches), version derivation, service
 wiring, the localhost proxy, and sharding end to end.
