@@ -1,9 +1,10 @@
 """
 End-to-end fixtures for the playwright module.
 
-Provides a static web server that the workspace wires into the playwright
-module (settings.service = "fixtures:server"), so `dagger check` exercises
-the full service-binding + localhost-proxy path against the fixture project.
+Provides a static web server that the e2e module binds into the playwright
+module as its service (the same wiring as settings.service =
+"dag://fixtures/server"), so `dagger check` exercises the full
+service-binding + localhost-proxy path against the fixture project.
 """
 type Fixtures {
   """
