@@ -24,6 +24,11 @@ type E2e {
     null
   }
 
+  # Whether a check fails when run.
+  let failed(check: Check!): Boolean! {
+    check.pass == false
+  }
+
   # The workspace with its working directory at the root, so keys and lookups
   # don't depend on where `dagger check` was invoked.
   let root(ws: Workspace!): Workspace! { ws.withWorkdir(".") }
@@ -49,7 +54,14 @@ type E2e {
       ctr.envVariable("PLAYWRIGHT_LOCALHOST_BASE_URL") == "http://localhost:8080",
       "PLAYWRIGHT_LOCALHOST_BASE_URL is not set",
     )
-    run(project.test(w))
+    # The whole project runs natively, one container per shard.
+    let tests = project.tests(w)
+    let shards = tests.batch.runs.{{shard, files}}
+    assert(
+      shards.map { r => r.shard }.join(",") == "1/2,2/2",
+      "a whole run is not one run per shard: " + shards.map { r => r.shard }.join(","),
+    )
+    run(tests.batch.test(w))
     null
   }
 
@@ -90,6 +102,15 @@ type E2e {
     assert(outside == "synthetic/a,synthetic/b", "unexpected keys outside any project: " + outside)
     let none = playwright.projects(w.withWorkdir(".dagger")).keys.length
     assert(none == 0, "found projects where there are none")
+
+    # Test files are keyed relative to their project, whatever the cwd.
+    let files = playwright.projects(w).get(key: "fixture").tests(w).keys.join(",")
+    assert(files == "tests/smoke.spec.ts", "unexpected test files in fixture: " + files)
+    let deep = w.withWorkdir("fixture/tests")
+    let fromTests = playwright.projects(deep).get(key: "fixture").tests(deep).keys.join(",")
+    assert(fromTests == files, "test file keys depend on the cwd: " + fromTests)
+    let nestedFiles = playwright.projects(w).get(key: "fixture/nested").tests(w).keys.join(",")
+    assert(nestedFiles == "tests/nested.spec.ts", "unexpected test files in fixture/nested: " + nestedFiles)
     null
   }
 
@@ -143,7 +164,7 @@ type E2e {
   }
 
   """
-  The projects collection supports get, subset and subset batches.
+  The projects and test-file collections support get, subset and batches.
   """
   collectionCheck(ws: Workspace!): Void @check {
     let w = root(ws)
@@ -175,11 +196,11 @@ type E2e {
 
     # The failing project is outside the subset, so this passes only if the
     # batch ran just its own keys.
-    run(only.batch.test(w))
+    only.batch.test(w)
 
     # The whole collection reports the failing project, and only it.
     let failure = {
-      run(projects.batch.test(w))
+      projects.batch.test(w)
       "unexpected success"
     } rescue {
       err: Error => err.message
@@ -189,9 +210,7 @@ type E2e {
 
     # With every project failing, the batch reports all of them.
     let both = {
-      run(
-        playwright(args: ["--bogus-option"]).projects(w).batch.test(w),
-      )
+      playwright(args: ["--bogus-option"]).projects(w).batch.test(w)
       "unexpected success"
     } rescue {
       err: Error => err.message
@@ -200,6 +219,35 @@ type E2e {
       both.contains("- fixture:") and both.contains("- fixture/nested:"),
       "batch did not report every failing project: " + both,
     )
+
+    # The test files of a project are a collection too.
+    let tests = synthetic.projects(syntheticWs).get(key: "defaults").tests(syntheticWs)
+    assert(tests.keys.join(",") == "a.spec.ts,b.test.mjs,sub/d.spec.tsx", "unexpected keys: " + tests.keys.join(","))
+    let pair = tests.subset(keys: ["sub/d.spec.tsx", "a.spec.ts"])
+    assert(pair.keys.join(",") == "a.spec.ts,sub/d.spec.tsx", "subset did not keep collection order: " + pair.keys.join(","))
+    assert(pair.get(key: "a.spec.ts").path == "a.spec.ts", "get inside a subset failed")
+    let outsideFile = {
+      pair.get(key: "b.test.mjs").path
+    } rescue {
+      err: Error => "rejected"
+    }
+    assert(outsideFile == "rejected", "get outside a subset succeeded")
+    let unknownFile = {
+      tests.subset(keys: ["nope.spec.ts"]).keys.join(",")
+    } rescue {
+      err: Error => "rejected"
+    }
+    assert(unknownFile == "rejected", "subset accepted an unknown test file")
+    let duplicateFile = {
+      tests.subset(keys: ["a.spec.ts", "a.spec.ts"]).keys.join(",")
+    } rescue {
+      err: Error => "rejected"
+    }
+    assert(duplicateFile == "rejected", "subset accepted a duplicate test file")
+    let noFiles = tests.subset(keys: empty)
+    assert(noFiles.keys.length == 0, "empty subset is not empty")
+    assert(noFiles.batch.runs.{{shard}}.length == 0, "an empty subset plans runs")
+    run(noFiles.batch.test(syntheticWs))
     null
   }
 
@@ -208,9 +256,180 @@ type E2e {
   """
   batchCheck(ws: Workspace!): Void @check {
     let w = root(ws)
-    run(wired.projects(w).batch.test(w))
+    wired.projects(w).batch.test(w)
     let report = playwright.project(w, "fixture").report(w)
     assert(report.entries.contains("index.html"), "report has no index.html")
+    null
+  }
+
+  # A small synthetic workspace of projects, one per config-reading rule.
+  # Search skips empty files, so every file has content.
+  let syntheticWs: Workspace! {
+    let body = "export {};\n"
+    directory
+      # Defaults: testDir is the config directory, the default testMatch, no
+      # node_modules, and a nested project keeps its own files.
+      .withNewFile("defaults/playwright.config.ts", "export default {};\n")
+      .withNewFile("defaults/a.spec.ts", body)
+      .withNewFile("defaults/b.test.mjs", body)
+      .withNewFile("defaults/c.ts", body)
+      .withNewFile("defaults/sub/d.spec.tsx", body)
+      .withNewFile("defaults/node_modules/x/e.spec.ts", body)
+      .withNewFile("defaults/inner/playwright.config.js", "module.exports = {};\n")
+      .withNewFile("defaults/inner/f.spec.js", body)
+      # A literal testDir.
+      .withNewFile(
+        "testdir/playwright.config.ts",
+        "import { defineConfig } from '@playwright/test';\n// testDir: 'nope'\nexport default defineConfig({\n  testDir: './e2e',\n  use: { baseURL: 'http://x:1/' },\n});\n",
+      )
+      .withNewFile("testdir/e2e/a.spec.ts", body)
+      .withNewFile("testdir/other/b.spec.ts", body)
+      # path.join(__dirname, ...).
+      .withNewFile(
+        "joined/playwright.config.ts",
+        "import path from 'path';\nexport default defineConfig({ testDir: path.join(__dirname, 'e2e') });\n",
+      )
+      .withNewFile("joined/e2e/a.spec.ts", body)
+      .withNewFile("joined/b.spec.ts", body)
+      # A testMatch glob.
+      .withNewFile("glob/playwright.config.ts", "export default defineConfig({ testMatch: '*.e2e.ts' });\n")
+      .withNewFile("glob/x.e2e.ts", body)
+      .withNewFile("glob/y.spec.ts", body)
+      # A testMatch array of a glob and a regex.
+      .withNewFile(
+        "array/playwright.config.ts",
+        "export default defineConfig({ testMatch: ['a/*.ts', /b\\.check\\.js$/] });\n",
+      )
+      .withNewFile("array/a/one.ts", body)
+      .withNewFile("array/a/deep/two.ts", body)
+      .withNewFile("array/b.check.js", body)
+      .withNewFile("array/c.spec.ts", body)
+      # A testMatch regex.
+      .withNewFile("regex/playwright.config.js", "module.exports = { testMatch: /.*\\.pw\\.ts$/i };\n")
+      .withNewFile("regex/x.PW.ts", body)
+      .withNewFile("regex/y.spec.ts", body)
+      # testIgnore.
+      .withNewFile("ignored/playwright.config.ts", "export default defineConfig({ testIgnore: '**/skip/**' });\n")
+      .withNewFile("ignored/a.spec.ts", body)
+      .withNewFile("ignored/skip/b.spec.ts", body)
+      # Playwright projects with their own testDir: keys are the union.
+      .withNewFile(
+        "projects/playwright.config.ts",
+        "export default defineConfig({\n  testDir: 'shared',\n  projects: [\n    { name: 'a', use: { ...devices['Desktop Chrome'] } },\n    { name: 'b', testDir: './b-tests' },\n  ],\n});\n",
+      )
+      .withNewFile("projects/shared/s.spec.ts", body)
+      .withNewFile("projects/b-tests/t.spec.ts", body)
+      .withNewFile("projects/other/o.spec.ts", body)
+      # Non-literal values fall back to the defaults.
+      .withNewFile(
+        "dynamic/playwright.config.ts",
+        "const dir = process.env.DIR;\nexport default defineConfig({ testDir: dir, testMatch: process.env.MATCH });\n",
+      )
+      .withNewFile("dynamic/a.spec.ts", body)
+      .withNewFile("dynamic/e2e/b.spec.ts", body)
+      # A regex RE2 can't compile falls back to the default testMatch.
+      .withNewFile("lookaround/playwright.config.ts", "export default defineConfig({ testMatch: /(?<=x)y\\.ts/ });\n")
+      .withNewFile("lookaround/a.spec.ts", body)
+      .withNewFile("lookaround/xy.ts", body)
+      # A config that isn't JavaScript falls back to the defaults.
+      .withNewFile("broken/playwright.config.ts", "this is {{ not ( javascript\n")
+      .withNewFile("broken/a.spec.ts", body)
+      .asWorkspace
+  }
+
+  let synthetic: Playwright! { playwright }
+
+  """
+  Test files follow the literal testDir, testMatch and testIgnore in each config.
+  """
+  configCheck: Void @check {
+    let ws = syntheticWs
+    let projects = synthetic.projects(ws)
+    let expect(project: String!, want: String!): Void {
+      let got = projects.get(key: project).tests(ws).keys.join(",")
+      assert(got == want, project + ": got " + got + ", want " + want)
+    }
+    expect("defaults", "a.spec.ts,b.test.mjs,sub/d.spec.tsx")
+    expect("defaults/inner", "f.spec.js")
+    expect("testdir", "e2e/a.spec.ts")
+    expect("joined", "e2e/a.spec.ts")
+    expect("glob", "x.e2e.ts")
+    expect("array", "a/one.ts,b.check.js")
+    expect("regex", "x.PW.ts")
+    expect("ignored", "a.spec.ts")
+    expect("projects", "b-tests/t.spec.ts,shared/s.spec.ts")
+    expect("dynamic", "a.spec.ts,e2e/b.spec.ts")
+    expect("lookaround", "a.spec.ts")
+    expect("broken", "a.spec.ts")
+
+    # Keys don't depend on the cwd.
+    let inside = ws.withWorkdir("testdir/e2e")
+    let fromInside = synthetic.projects(inside).get(key: "testdir").tests(inside).keys.join(",")
+    assert(fromInside == "e2e/a.spec.ts", "keys changed with the cwd: " + fromInside)
+    null
+  }
+
+  # A project whose tests need no browser or service: a.spec.ts passes and
+  # aa.spec.ts fails (a filter for "a.spec.ts" alone would also match it),
+  # b, c and d pass.
+  let runWs: Workspace! {
+    let pass = "import { test, expect } from '@playwright/test';\ntest('passes', () => { expect(1).toBe(1); });\n"
+    let fail = "import { test, expect } from '@playwright/test';\ntest('fails', () => { expect(1).toBe(2); });\n"
+    directory
+      .withNewFile(
+        "runs/package.json",
+        "{ \"name\": \"runs\", \"private\": true, \"devDependencies\": { \"@playwright/test\": \"1.58.2\" } }\n",
+      )
+      .withNewFile("runs/playwright.config.ts", "import { defineConfig } from '@playwright/test';\nexport default defineConfig({ testDir: 'tests' });\n")
+      .withNewFile("runs/tests/a.spec.ts", pass)
+      .withNewFile("runs/tests/aa.spec.ts", fail)
+      .withNewFile("runs/tests/b.spec.ts", pass)
+      .withNewFile("runs/tests/c.spec.ts", pass)
+      .withNewFile("runs/tests/d.spec.ts", pass)
+      .asWorkspace
+  }
+
+  """
+  Filtered runs select exactly their files in groups; whole runs shard the project.
+  """
+  runCheck: Void @check {
+    let ws = runWs
+    let tests = playwright(shards: 2).projects(ws).get(key: "runs").tests(ws)
+    let a = "tests/a.spec.ts"
+    let aa = "tests/aa.spec.ts"
+    assert(
+      tests.keys.join(",") == "tests/a.spec.ts,tests/aa.spec.ts,tests/b.spec.ts,tests/c.spec.ts,tests/d.spec.ts",
+      "unexpected keys: " + tests.keys.join(","),
+    )
+
+    # Exactly one file, though its name is a substring of a failing one.
+    run(tests.subset(keys: [a]).batch.test(ws))
+    run(tests.get(key: a).test(ws))
+    assert(failed(tests.get(key: aa).test(ws)), "the failing file passed on its own")
+
+    # More files than shards: two groups, in order, each its own container.
+    let three = tests.subset(keys: [a, "tests/b.spec.ts", "tests/c.spec.ts"])
+    let groups = three.batch.runs.{{files, shard}}.map { r => r.files.join("+") }.join(" | ")
+    assert(groups == "tests/a.spec.ts+tests/b.spec.ts | tests/c.spec.ts", "unexpected groups: " + groups)
+    run(three.batch.test(ws))
+
+    # A failing group is reported, and only that group.
+    let failure = {
+      run(tests.subset(keys: [a, aa]).batch.test(ws))
+      "unexpected success"
+    } rescue {
+      err: Error => err.message
+    }
+    assert(failure.contains("- tests/aa.spec.ts:"), "the failing group was not reported: " + failure)
+    assert(failure.contains("- tests/a.spec.ts:") == false, "a passing group was reported: " + failure)
+
+    # The whole run is one container per shard, and it fails.
+    let whole = tests.batch.runs.{{files, shard}}
+    assert(
+      whole.map { r => r.shard }.join(",") == "1/2,2/2",
+      "a whole run is not one run per shard: " + whole.map { r => r.shard }.join(","),
+    )
+    assert(failed(tests.batch.test(ws)), "the whole run missed the failing file")
     null
   }
 }

@@ -73,6 +73,349 @@ let depth(p: String!): Int! {
   if (p == ".") { 0 } else { p.split("/").length }
 }
 
+# Static reading of playwright.config: only literal values are honoured, and
+# nothing here runs a container or Node. Offsets are byte offsets, so the
+# source is made ASCII first.
+
+# Playwright's default testMatch.
+let defaultTestMatch = "**/*.@(spec|test).?(c|m)[jt]s?(x)"
+
+# A JS string literal: single, double, or backtick without interpolation.
+let stringLiteral = `'(?:[^'\\\n]|\\.)*'|"(?:[^"\\\n]|\\.)*"|` + "`" + `(?:[^` + "`" + `$\\]|\\[\s\S])*` + "`"
+
+# A JS regex literal body and flags.
+let regexLiteral = `/(?:[^/\\\n\[*]|\\.|\[(?:[^\]\\\n]|\\.)*\])(?:[^/\\\n\[]|\\.|\[(?:[^\]\\\n]|\\.)*\])*/[a-z]*`
+
+# One literal pattern: a string (a glob) or a regex literal.
+let patternLiteral = stringLiteral + "|" + regexLiteral
+
+# Comments, strings and regex literals: everything whose brackets and commas
+# are not code. A regex literal is recognized only after a character that can
+# precede an expression, captured so masking keeps it.
+let tokenPattern = `//[^\n]*|/\*[\s\S]*?\*/|` + stringLiteral + `|([:\[,(=!&|?]\s*)` + regexLiteral
+
+# A run of n filler characters.
+let fill(n: Int!, char: String!): String! {
+  "".padRight(n).replace(" ", char)
+}
+
+# Byte length of an ASCII string.
+let size(s: String!): Int! { s.split("").length }
+
+# The bytes of s in [start, end); s must be ASCII.
+let slice(s: String!, start: Int!, end: Int!): String! {
+  s.truncate(end).trimPrefix(s.truncate(start))
+}
+
+# Replace comments, strings and regex literals with filler of the same length,
+# so offsets line up with the source while their brackets and commas vanish.
+let mask(source: String!): String! {
+  source.rewriteMatches(Regexp(tokenPattern)) { m =>
+    let lead = m.captures[0] ?? ""
+    # Comments read as whitespace; literals as an opaque word.
+    let char = if (m.string.hasPrefix("/")) { " " } else { "_" }
+    lead + fill(m.end - m.start - size(lead), char)
+  }
+}
+
+# Replace every innermost bracketed group with filler of the same length,
+# keeping a marker for its opening bracket: "~" for {, "^" for [, "%" for (.
+let flattenOnce(masked: String!): String! {
+  masked.rewriteMatches(`[{\[(][^{}\[\]()]*[}\])]`) { m =>
+    let open = if (m.string.hasPrefix("{")) { "~" } else if (m.string.hasPrefix("[")) { "^" } else { "%" }
+    open + fill(m.end - m.start - 1, "_")
+  }
+}
+
+# The group opening at offset start, once everything nested in it has been
+# flattened: its own top level is then plain text. Null when there is none.
+let groupAt(masked: String!, start: Int!): String {
+  let hits = masked.matchAll(`[{\[(][^{}\[\]()]*[}\])]`).filter { m => m.start == start }
+  let hit = hits[0]
+  if (hit != null) {
+    return hit.string
+  }
+  let next = flattenOnce(masked)
+  if (next == masked) {
+    return null
+  }
+  groupAt(next, start)
+}
+
+# A string literal's value, or null when text is anything else.
+let stringValue(text: String!): String {
+  let m = text.trimSpace.match(Regexp(`^(?:'((?:[^'\\\n]|\\.)*)'|"((?:[^"\\\n]|\\.)*)"|` + "`" + `([^` + "`" + `$\\]*)` + "`" + `)$`))
+  if (m == null) {
+    return null
+  }
+  m.captures.join("").replaceMatches(`\\(.)`, "$1")
+}
+
+# A testDir value relative to the config directory: a string literal, or
+# path.join/path.resolve of __dirname and string literals. Null otherwise.
+let dirValue(text: String!): String {
+  let plain = stringValue(text)
+  if (plain != null) {
+    return plain
+  }
+  let call = text.trimSpace.match(
+    Regexp(`^(?:path\.)?(?:join|resolve)\(\s*(?:__dirname|import\.meta\.dirname)((?:\s*,\s*(?:` + stringLiteral + `))+)\s*,?\s*\)$`),
+  )
+  if (call == null) {
+    return null
+  }
+  let parts = (call.captures[0] ?? "").matchAll(Regexp(stringLiteral)).map { p => stringValue(p.string) ?? "" }
+  parts.join("/")
+}
+
+# A literal pattern as a regexp over absolute paths, or null when it cannot
+# be translated: a string is a glob, /.../flags a regex literal.
+let patternRegex(text: String!): String {
+  let glob = stringValue(text)
+  if (glob != null) {
+    return globRegex(glob)
+  }
+  let re = text.trimSpace.match(`^/([\s\S]*)/([a-z]*)$`)
+  if (re == null) {
+    return null
+  }
+  let flags = re.captures[1] ?? ""
+  let prefix = ["i", "m", "s"].filter { f => flags.contains(f) }.join("")
+  let pattern = (if (prefix == "") { "" } else { "(?" + prefix + ")" }) + (re.captures[0] ?? "")
+  # RE2 has no lookaround or backreferences; such a regex falls back.
+  let ok = { Regexp(pattern); true } rescue {
+    err: Error => false
+  }
+  if (ok) { pattern } else { null }
+}
+
+# A testMatch/testIgnore value as regexps: a literal pattern or an array of
+# them. Null when the value is anything else, or any element can't be read.
+let patternsValue(text: String!): [String!] {
+  let trimmed = text.trimSpace
+  let items = if (trimmed.hasPrefix("[") and trimmed.hasSuffix("]")) {
+    let inner = trimmed.trimPrefix("[").trimSuffix("]")
+    let element = Regexp(`\s*(?:` + patternLiteral + `)\s*(?:,|$)`)
+    if (inner.replaceMatches(element, with: "").trimSpace != "") {
+      return null
+    }
+    inner.matchAll(element).map { m => m.string.trimSpace.trimSuffix(",") }
+  } else {
+    [trimmed]
+  }
+  let regexes = items.map { item => patternRegex(item) ?? "" }
+  if (regexes.contains("")) { null } else { regexes }
+}
+
+# A glob in minimatch syntax (nocase, dot) as a regexp over absolute paths,
+# matched like Playwright does: a pattern not starting with **/ gets one.
+# Null for syntax this does not translate (!(...)).
+let globRegex(glob: String!): String {
+  let tokens = glob.matchAll(
+    `\*\*/|\*\*|[@?+*!]\(|[{}()|,*?/]|\[(?:\\.|[^\]\\])+\]|\\.|[^*?\[\]{}()|,@+!\\/]+|[\s\S]`,
+  ).map { m => m.string }
+  let empty: [String!]! = []
+  let state = tokens.reduce({{out: "", stack: empty, bad: false}}) { st, tok =>
+    let top = st.stack.takeLast(1)[0] ?? ""
+    let inBrace = top == "{"
+    let inExt = top != "" and top != "{"
+    if (tok == "**/") {
+      {{out: st.out + "(?:.*/)?", stack: st.stack, bad: st.bad}}
+    } else if (tok == "**") {
+      {{out: st.out + ".*", stack: st.stack, bad: st.bad}}
+    } else if (tok == "*") {
+      {{out: st.out + "[^/]*", stack: st.stack, bad: st.bad}}
+    } else if (tok == "?") {
+      {{out: st.out + "[^/]", stack: st.stack, bad: st.bad}}
+    } else if (tok == "!(") {
+      {{out: st.out, stack: st.stack, bad: true}}
+    } else if (tok == "@(" or tok == "?(" or tok == "+(" or tok == "*(") {
+      {{
+        out: st.out + "(?:",
+        stack: st.stack + [tok.trimSuffix("(")],
+        bad: st.bad
+      }}
+    } else if (tok == "{") {
+      {{out: st.out + "(?:", stack: st.stack + ["{"], bad: st.bad}}
+    } else if (tok == "}" and inBrace) {
+      {{out: st.out + ")", stack: st.stack.dropLast(1), bad: st.bad}}
+    } else if (tok == "," and inBrace) {
+      {{out: st.out + "|", stack: st.stack, bad: st.bad}}
+    } else if (tok == "|" and inExt) {
+      {{out: st.out + "|", stack: st.stack, bad: st.bad}}
+    } else if (tok == ")" and inExt) {
+      let suffix = if (top == "@") { "" } else { top }
+      {{out: st.out + ")" + suffix, stack: st.stack.dropLast(1), bad: st.bad}}
+    } else if (tok.hasPrefix("[") and tok.hasSuffix("]") and size(tok) > 2) {
+      let body = tok.trimPrefix("[").trimSuffix("]")
+      let negated = if (body.hasPrefix("!")) { "^" + body.trimPrefix("!") } else { body }
+      {{out: st.out + "[" + negated + "]", stack: st.stack, bad: st.bad}}
+    } else if (tok.hasPrefix("\\") and size(tok) == 2) {
+      {{
+        out: st.out + Regexp.escape(tok.trimPrefix("\\")),
+        stack: st.stack,
+        bad: st.bad
+      }}
+    } else {
+      {{out: st.out + Regexp.escape(tok), stack: st.stack, bad: st.bad}}
+    }
+  }
+  if (state.bad or state.stack.length > 0) {
+    return null
+  }
+  let body = if (glob.hasPrefix("**/")) { state.out } else { "(?:.*/)?" + state.out }
+  let pattern = "(?i)^" + body + "$"
+  let ok = { Regexp(pattern); true } rescue {
+    err: Error => false
+  }
+  if (ok) { pattern } else { null }
+}
+
+# What a config says about one field: "absent", "literal" (with values), or
+# "dynamic" (set to something this can't read).
+let field(state: String!, values: [String!]!): {{state: String!, values: [String!]!}}! {
+  {{state, values}}
+}
+
+# The literal settings of one object (the config, or one of its projects):
+# testDir, testMatch and testIgnore, plus the offset of its projects array.
+let objectSettings(source: String!, masked: String!, start: Int!): {{testDir: {{state: String!, values: [String!]!}}!, testMatch: {{state: String!, values: [String!]!}}!, testIgnore: {{state: String!, values: [String!]!}}!, projects: Int!}}! {
+  let body = groupAt(masked, start) ?? ""
+  # Keys at this object's top level; nested objects are flattened, so their
+  # keys don't match. A key without a value (shorthand) reads as dynamic.
+  let props = body.matchAll(`[{,]\s*(\w+)\s*(:\s*[^,}]*|[,}])`)
+  let read(name: String!, parse: String!): {{state: String!, values: [String!]!}}! {
+    let hit = props.filter { m => (m.captures[0] ?? "") == name }.takeLast(1)[0]
+    if (hit == null) {
+      return field("absent", [])
+    }
+    let rest = hit.captures[1] ?? ""
+    if (rest.hasPrefix(":") == false) {
+      return field("dynamic", [])
+    }
+    let valueEnd = start + hit.end
+    let valueStart = valueEnd - size(rest) + 1
+    let text = slice(source, valueStart, valueEnd)
+    let values = if (parse == "dir") {
+      let dir = dirValue(text)
+      if (dir == null) { null } else { [dir] }
+    } else {
+      patternsValue(text)
+    }
+    if (values == null) { field("dynamic", []) } else { field("literal", values) }
+  }
+  let projectsHit = props.filter { m => (m.captures[0] ?? "") == "projects" }.takeLast(1)[0]
+  let projects = if (projectsHit == null) {
+    -1
+  } else {
+    let rest = projectsHit.captures[1] ?? ""
+    let valueEnd = start + projectsHit.end
+    let valueStart = valueEnd - size(rest) + 1
+    let lead = size(slice(source, valueStart, valueEnd)) - size(
+      slice(source, valueStart, valueEnd).trimLeft(" \t\r\n"),
+    )
+    let at = valueStart + lead
+    if (slice(masked, at, at + 1) == "[") { at } else { -1 }
+  }
+  {{
+    testDir: read("testDir", "dir"),
+    testMatch: read("testMatch", "patterns"),
+    testIgnore: read("testIgnore", "patterns"),
+    projects
+  }}
+}
+
+# The Playwright projects a config defines, as (testDir relative to the config
+# directory, testMatch regexps, testIgnore regexps). Literal values only;
+# anything else falls back to Playwright's defaults, and a config this can't
+# read at all gives one project with every default.
+let configSpecs(config: String!): [{{dir: String!, match: [String!]!, ignore: [String!]!}}!]! {
+  let defaultMatch: [String!]! = [globRegex(defaultTestMatch) ?? ""]
+  let empty: [String!]! = []
+  let defaults = [{{dir: ".", match: defaultMatch, ignore: empty}}]
+  let source = config.replaceMatches(`[^\x00-\x7F]`, with: "?")
+  let masked = mask(source)
+  let found = masked.match(`(?:defineConfig\s*\(\s*|export\s+default\s+|module\.exports\s*=\s*)\{`)
+  if (found == null) {
+    return defaults
+  }
+  let top = objectSettings(source, masked, found.end - 1)
+  let resolve(
+    value: {{state: String!, values: [String!]!}}!,
+    inherited: [String!]!,
+    fallback: [String!]!,
+  ): [String!]! {
+    if (value.state == "literal") { value.values } else if (value.state == "dynamic") { fallback } else { inherited }
+  }
+  let dir = resolve(top.testDir, ["."], ["."])
+  let match = resolve(top.testMatch, defaultMatch, defaultMatch)
+  let ignore = resolve(top.testIgnore, empty, empty)
+  let base = [{{dir: dir[0] ?? ".", match, ignore}}]
+  if (top.projects < 0) {
+    return base
+  }
+  let array = groupAt(masked, top.projects) ?? ""
+  let entries = array
+    .matchAll(`~_*`)
+    .map { m => top.projects + m.start }
+    .filter { at => slice(masked, at, at + 1) == "{" }
+  if (entries.length == 0) {
+    return base
+  }
+  entries.map { at =>
+    let own = objectSettings(source, masked, at)
+    {{
+      dir: resolve(own.testDir, dir, ["."])[0] ?? ".",
+      match: resolve(own.testMatch, match, defaultMatch),
+      ignore: resolve(own.testIgnore, ignore, empty)
+    }}
+  }
+}
+
+# relPath is to, relative to from; both are root-relative directories/files.
+let relPath(from: String!, to: String!): String! {
+  if (from == ".") {
+    return to
+  }
+  if (to.hasPrefix(from + "/")) {
+    return to.trimPrefix(from + "/")
+  }
+  let a = from.split("/")
+  let b = if (to == ".") { [] :: [String!]! } else { to.split("/") }
+  let common = a.reduce({{n: 0, same: true}}) { st, seg =>
+    if (st.same and (b[st.n] ?? "") == seg) {
+      {{n: st.n + 1, same: true}}
+    } else {
+      {{n: st.n, same: false}}
+    }
+  }
+  let up = range(a.length - common.n).map { i => ".." }
+  (up + b.dropFirst(common.n)).join("/")
+}
+
+# under reports whether a root-relative path is dir or inside it.
+let under(dir: String!, p: String!): Boolean! {
+  dir == "." or p == dir or p.hasPrefix(dir + "/")
+}
+
+# splitInto divides items into at most count contiguous groups whose sizes
+# differ by at most one, keeping their order.
+let splitInto(items: [String!]!, count: Int!): [[String!]!]! {
+  let n = items.length
+  let groups = if (count < n) { count } else { n }
+  if (groups <= 0) {
+    return [] :: [[String!]!]!
+  }
+  let size = n / groups
+  let extra = n % groups
+  range(groups).map { k =>
+    let i = k - 1
+    let start = i * size + (if (i < extra) { i } else { extra })
+    let length = size + (if (i < extra) { 1 } else { 0 })
+    items.dropFirst(start).takeFirst(length)
+  }
+}
+
 """
 Run Playwright browser tests against the projects in a workspace.
 """
@@ -245,7 +588,7 @@ type PlaywrightProjects @collection {
   """
   Run Playwright tests in the selected projects.
   """
-  test(ws: Workspace!): Void @check {
+  test(ws: Workspace!): Void {
     # A selection over a list evaluates its elements concurrently, so every
     # project (and each project's shards) runs in parallel.
     let failures = paths.map { p => project(p) }.{{path, failure: testFailure(ws)}}
@@ -425,42 +768,165 @@ type PlaywrightProject {
     }
   }
 
-  # testCommand builds the exec for one shard, wrapping in a socat localhost
-  # proxy when enabled.
-  let testCommand(shard: String!): [String!]! {
-    let testArgs = ["npx", "playwright", "test"] + tool.args + [`--shard=${shard}`]
+  # testCommand is the exec for one run with extra arguments, wrapped in a
+  # socat localhost proxy when enabled. Arguments reach the shell as "$@", so
+  # file filters are never re-parsed by it.
+  let testCommand(extra: [String!]!): [String!]! {
+    let testArgs = ["npx", "playwright", "test"] + tool.args + extra
     if (tool.localhostProxy and tool.service != null) {
       # Background socat so localhost:<port> reaches the service during the run.
       let host = tool.serviceHostname
-      ["sh", "-c", `socat TCP-LISTEN:${servicePort},fork,reuseaddr TCP:${host}:${servicePort} & exec ${testArgs.join(" ")}`]
+      [
+        "sh",
+        "-c",
+        `socat TCP-LISTEN:${servicePort},fork,reuseaddr TCP:${host}:${servicePort} & exec "$@"`,
+        "sh",
+      ] + testArgs
     } else {
       testArgs
     }
   }
 
-  """
-  Run this project's Playwright tests.
-  """
-  test(ws: Workspace!): Void @check {
-    let failure = testFailure(ws)
-    if (failure != null) {
-      raise "Playwright project " + path + ": " + failure
+  # Playwright reads each positional argument as a case-insensitive regexp
+  # over absolute file paths, so "a.spec.ts" also selects "aa.spec.ts". An
+  # anchored, escaped absolute path selects exactly one file.
+  let fileFilter(file: String!): String! {
+    "^" + Regexp.escape(appPath(rootPath(path, file))) + "$"
+  }
+
+  # The container for one run.
+  let runContainer(ws: Workspace!, run: PlaywrightRun!): Container! {
+    let extra = if (run.shard != "") {
+      ["--shard=" + run.shard]
+    } else {
+      run.files.map { file => fileFilter(file) }
+    }
+    base(ws).withExec(testCommand(extra))
+  }
+
+  # One run per shard: Playwright runs the whole project with its own config.
+  let wholeRuns: [PlaywrightRun!]! {
+    let n = tool.shards
+    range(n).map { i => PlaywrightRun(files: [], shard: `${i}/${n}`, project: self) }
+  }
+
+  # The given files split into at most `shards` groups, one run each.
+  let fileRuns(files: [String!]!): [PlaywrightRun!]! {
+    splitInto(files, tool.shards).map { group =>
+      PlaywrightRun(
+        files: group,
+        shard: "",
+        project: self,
+      )
+    }
+  }
+
+  # Run concurrently, raising one error that lists every failing run.
+  let runAll(ws: Workspace!, runs: [PlaywrightRun!]!): Void {
+    let failures = runs.{{label, failure(ws)}}.filter { r => r.failure != null }
+    if (failures.length > 0) {
+      raise "Playwright tests failed in " + path + ":\n" + failures.map { r =>
+        "- " + r.label + ": " + (r.failure ?? "")
+      }.join("\n")
     }
     null
   }
 
-  # Error message from running this project's shards, or null when they pass.
+  """
+  Run this project's tests, sharded across `shards` containers.
+  """
+  test(ws: Workspace!): Void {
+    runAll(ws, wholeRuns)
+  }
+
+  # Run exactly these project-relative test files.
+  let runFiles(ws: Workspace!, files: [String!]!): Void {
+    runAll(ws, fileRuns(files))
+  }
+
+  # Error message from running this project's tests, or null when they pass.
   let testFailure(ws: Workspace!): String {
-    {
-      let b = base(ws)
-      let n = tool.shards
-      let runs = range(n).map { i => b.withExec(testCommand(`${i}/${n}`)) }
-      # {{ }} forces every shard concurrently, failing fast on the first error
-      runs.{{out: stdout}}
-      null
-    } rescue {
+    { test(ws); null } rescue {
       err: Error => err.message
     }
+  }
+
+  """
+  Test files in this project, keyed by project-relative path.
+  """
+  tests(ws: Workspace!): PlaywrightTestFiles! {
+    PlaywrightTestFiles(files: testFiles(ws), project: self)
+  }
+
+  # The project's playwright.config source, or "" when there is none or it
+  # can't be read.
+  let configSource(ws: Workspace!): String! {
+    let prefix = if (path == ".") { "" } else { path + "/" }
+    let present = ws.glob(prefix + "playwright.config.*").map { f => f.trimPrefix("/").trimPrefix("./") }
+    let name = configNames.filter { n => present.contains(prefix + n) }[0]
+    if (name == null) {
+      return ""
+    }
+    { ws.file(wsPath(prefix + name)).contents } rescue {
+      err: Error => ""
+    }
+  }
+
+  # Test files come from one ripgrep search over the project's test
+  # directories, filtered by testMatch and testIgnore as read statically from
+  # its config (see README), so listing runs no container. node_modules and
+  # .git are pruned by the search itself. Config files come back from the
+  # same search and mark nested projects, whose files are left out. Search
+  # lists only files with content, so empty files are not keys. Keys are
+  # byte-ordered, so they are stable.
+  let testFiles(ws: Workspace!): [String!]! {
+    let specs = configSpecs(configSource(ws)).map { spec =>
+      {{
+        dir: if (spec.dir.hasPrefix("/")) { path } else { rootPath(path, spec.dir) },
+        match: spec.match,
+        ignore: spec.ignore
+      }}
+    }
+    let defaultMatch = globRegex(defaultTestMatch) ?? ""
+    let custom = specs.any { spec => spec.match.join("\n") != defaultMatch }
+    # Playwright's default testMatch as search globs; any other testMatch
+    # searches every script file and filters below.
+    let candidates = if (custom) {
+      "*.{js,jsx,ts,tsx,mjs,cjs,mts,cts,mjsx,cjsx,mtsx,ctsx}"
+    } else {
+      "*.{spec,test}.{js,jsx,ts,tsx,mjs,cjs,mts,cts,mjsx,cjsx,mtsx,ctsx}"
+    }
+    let roots = specs.map { spec => spec.dir }.uniq
+    let found = {
+      ws
+        .search(
+          paths: roots.map { dir => wsPath(dir) },
+          globs: [candidates, "playwright.config.{ts,js,mjs,cjs,mts,cts}", "!node_modules", "!.git"],
+          pattern: "",
+          filesOnly: true,
+        ).{{filePath}}
+        .map { result => result.filePath.trimPrefix("/").trimPrefix("./") }
+    } rescue {
+      err: Error => [] :: [String!]!
+    }
+    let isConfig(file: String!): Boolean! {
+      configNames.contains(file.split("/").takeLast(1).join(""))
+    }
+    let nested = found
+      .filter { file => isConfig(file) }
+      .map { file => dirOf("/" + file) }
+      .filter { dir => dir != path and under(path, dir) }
+    let files = found.filter { file =>
+      isConfig(file) == false
+        and nested.any { dir => under(dir, file) } == false
+        and specs.any { spec =>
+          let abs = appPath(file)
+          under(spec.dir, file)
+            and spec.match.any { re => abs.containsMatch(Regexp(re)) }
+            and spec.ignore.any { re => abs.containsMatch(Regexp(re)) } == false
+        }
+    }
+    sorted(files.map { file => relPath(path, file) }.uniq)
   }
 
   """
@@ -468,7 +934,106 @@ type PlaywrightProject {
   """
   report(ws: Workspace!): Directory! {
     base(ws)
-      .withExec(testCommand("1/1"), expect: ReturnType.ANY)
+      .withExec(testCommand([]), expect: ReturnType.ANY)
       .directory("playwright-report")
+  }
+}
+
+"""
+Test files in a Playwright project, keyed by project-relative path.
+"""
+type PlaywrightTestFiles @collection {
+  """
+  Test file paths, relative to the project directory.
+  """
+  files: [String!]! @keys
+
+  """
+  Test files selected in or out since the collection was discovered.
+  """
+  delta: CollectionDelta
+
+  let project: PlaywrightProject!
+
+  """
+  The test file at this project-relative path.
+  """
+  file(path: String!): PlaywrightTestFile! @get {
+    PlaywrightTestFile(path: path, project: project)
+  }
+
+  """
+  The containers a test of the selected files runs: one per shard when
+  nothing is filtered out, else the selected files split into up to `shards`
+  groups.
+  """
+  runs: [PlaywrightRun!]! {
+    # With nothing selected out, run the project natively with its own config
+    # rather than naming every file. Without a delta, the explicit list is
+    # the safe choice.
+    let whole = if (delta == null) {
+      false
+    } else {
+      delta.addedKeys.length == 0 and delta.removedKeys.length == 0
+    }
+    if (whole) { project.wholeRuns } else { project.fileRuns(files) }
+  }
+
+  """
+  Run the selected test files in this project.
+  """
+  test(ws: Workspace!): Void @check {
+    project.runAll(ws, runs)
+  }
+}
+
+"""
+A Playwright test file.
+"""
+type PlaywrightTestFile {
+  """
+  Test file path, relative to the project directory.
+  """
+  path: String!
+
+  let project: PlaywrightProject!
+
+  """
+  Run this test file.
+  """
+  test(ws: Workspace!): Void @check {
+    project.runFiles(ws, [path])
+  }
+}
+
+"""
+One test container: a shard of a whole project, or a group of selected files.
+"""
+type PlaywrightRun {
+  """
+  Test files this run is limited to, relative to the project. Empty for a
+  shard of the whole project.
+  """
+  files: [String!]!
+
+  """
+  The shard of the whole project this run covers ("1/2"), or empty.
+  """
+  shard: String!
+
+  let project: PlaywrightProject!
+
+  """
+  What this run covers, for messages.
+  """
+  label: String! {
+    if (shard != "") { "shard " + shard } else { files.join(", ") }
+  }
+
+  # Error message from this run, or null when it passes.
+  let failure(ws: Workspace!): String {
+    { project.runContainer(ws, self).sync; null } rescue {
+      err: Error => err.message
+    }
   }
 }
