@@ -9,14 +9,19 @@ source = "github.com/dagger/dang-sdk"
 # Marker filename that skips generate when found at or above a Dang SDK module root.
 # settings.skipGenerateFilename = ""
 
-[modules.dang-sdk.as-sdk]
-name = "dang"
+[modules.dagger-dang-sdk]
+source = "github.com/dagger/dang-sdk"
 
-[[modules.dang-sdk.as-sdk.modules]]
-path = "."
+[sdks.dang]
+module = "dagger-dang-sdk"
 
-[[modules.dang-sdk.as-sdk.modules]]
-path = ".dagger/modules/fixtures"
+[sdks.dang.scopes."."]
+is-module = true
+name = "playwright"
 
-[[modules.dang-sdk.as-sdk.modules]]
-path = ".dagger/modules/e2e"
+[sdks.dang.scopes.".dagger/modules/fixtures"]
+is-module = true
+
+[sdks.dang.scopes.".dagger/modules/e2e"]
+clients = ["./.", "./.dagger/modules/fixtures"]
+is-module = true

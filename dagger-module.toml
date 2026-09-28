@@ -1,5 +1,5 @@
 name = "playwright"
-engineVersion = "v1.0.0-beta.6"
+engineVersion = "v1.0.0-beta.14"
 
 [runtime]
   source = "dang"

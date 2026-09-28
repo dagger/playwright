@@ -9,7 +9,7 @@ type Fixtures {
   """
   A static file server hosting the fixture page on port 8080.
   """
-  pub server: Service! {
+  server: Service! {
     container
       .from("python:3.12-alpine")
       .withNewFile(
