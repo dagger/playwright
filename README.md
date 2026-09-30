@@ -178,7 +178,7 @@ way, every container binds the same service, and a failure lists every
 failing shard or group:
 
 ```
-Playwright tests failed in apps/web:
+Playwright failed in apps/web:
 - tests/a.spec.ts, tests/aa.spec.ts: playwright test failed (exit 1):
   …the end of the output…
 ```
@@ -242,10 +242,18 @@ monorepo root.
   `"packageManager"`.
 - **Caching:** the install step sees only what an install reads — every
   `package.json`, lockfiles, `pnpm-workspace.yaml`, `.npmrc`/`.yarnrc*`,
-  `.yarn/` releases and plugins, `patches/` — and the rest of the source is
-  laid over it afterwards, so editing a test or source file doesn't re-run
-  the install. The npm, pnpm store, yarn, bun and corepack caches live on
-  cache volumes.
+  `.yarn/` releases and plugins, `patches/`, the directories of `file:`,
+  `link:`, `portal:` and injected dependencies, and workspace packages' `bin`
+  files — and the rest of the source is laid over it afterwards, so editing a
+  test or source file doesn't re-run the install. The npm, pnpm store, yarn,
+  bun and corepack caches live on cache volumes.
+- **Lifecycle scripts** (`prepare`, `postinstall`, …) run during the install,
+  before the rest of the source is there. A script that builds from source
+  fails — reported as `install failed (…, exit N)` with the end of its output
+  — or leaves a half-built package. Skip them with
+  `installFlags = ["--ignore-scripts"]` and build as part of the test run
+  instead, e.g. in your config's `webServer.command`
+  (`pnpm build && pnpm preview`), which runs with the full source.
 - **Playwright itself:** tests run the project's own
   `node_modules/.bin/playwright` (the nearest between the project and the
   install root, or `yarn playwright` under Plug'n'Play), never a version `npx`
@@ -334,7 +342,7 @@ They apply to every project:
 - **`installFlags`** (default `[]`): extra arguments for the install command,
   e.g. `["--ignore-scripts"]`.
 - **`environment`** (default `[]`): environment variables for the test
-  containers, as `KEY=VALUE`, e.g. `["KIT_E2E_BROWSER=chromium"]`.
+  containers, as `KEY=VALUE`, e.g. `["DEBUG=pw:api"]`.
 - **`localhostProxy`** (default `false`): see secure contexts above.
 - **`args`** (default `[]`): extra arguments for every `playwright test`
   invocation, e.g. `["--project", "chromium"]`.

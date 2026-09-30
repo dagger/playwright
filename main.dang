@@ -673,7 +673,7 @@ type Playwright {
     installFlags: [String!]! = [],
     """
     Environment variables set in the test containers, as KEY=VALUE
-    (e.g. ["KIT_E2E_BROWSER=chromium"]).
+    (e.g. ["DEBUG=pw:api"]).
     """
     environment: [String!]! = [],
     """
@@ -783,7 +783,7 @@ type PlaywrightProjects @collection {
     let failures = paths.map { p => project(p) }.{{path, failure: testFailure(ws)}}
       .filter { result => result.failure != null }
     if (failures.length > 0) {
-      raise "Playwright tests failed:\n" + failures.map { result =>
+      raise "Playwright failed:\n" + failures.map { result =>
         "- " + result.path + ": " + (result.failure ?? "")
       }.join("\n")
     }
@@ -1286,7 +1286,7 @@ type PlaywrightProject {
   let runAll(ws: Workspace!, runs: [PlaywrightRun!]!): Void {
     let failures = runs.{{label, failure(ws)}}.filter { r => r.failure != null }
     if (failures.length > 0) {
-      raise "Playwright tests failed in " + path + ":\n" + failures.map { r =>
+      raise "Playwright failed in " + path + ":\n" + failures.map { r =>
         "- " + r.label + ": " + (r.failure ?? "")
       }.join("\n")
     }
