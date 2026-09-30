@@ -1140,7 +1140,12 @@ type PlaywrightProject {
       .withMountedCache("/root/.cache/pnpm-store", cacheVolume("playwright-pnpm-store"))
       # pnpm's own launcher downloads the pnpm version a project pins.
       .withMountedCache("/root/.local/share/pnpm", cacheVolume("playwright-pnpm-home"))
-      .withMountedCache("/root/.cache/yarn", cacheVolume("playwright-yarn"))
+      # Concurrent yarn 1 installs corrupt a shared cache, so one at a time.
+      .withMountedCache(
+        "/root/.cache/yarn",
+        cacheVolume("playwright-yarn"),
+        sharing: CacheSharingMode.LOCKED,
+      )
       .withEnvVariable("YARN_CACHE_FOLDER", "/root/.cache/yarn")
       .withMountedCache("/root/.cache/bun", cacheVolume("playwright-bun"))
       .withEnvVariable("BUN_INSTALL_CACHE_DIR", "/root/.cache/bun")
