@@ -6,9 +6,7 @@ project, with first-class [workspace service
 wiring](https://docs.dagger.io/config/module-wiring): point it at any module
 function that returns a `Service` and your tests run against it.
 
-Requires Dagger engine `v1.0.0-beta.15` or later. beta.15 is not released
-yet, so for now the module only loads on a dev engine; a released engine fails
-to load it.
+Requires Dagger v1.0.0-beta.15 or later.
 
 ## Functions
 
@@ -26,7 +24,9 @@ On a project:
 | `report`       | Run the tests tolerating failures; returns the HTML report `Directory`.       |
 | `base`         | The prepared test container (workspace mounted, deps installed, service bound). |
 | `imageAddress` | The resolved Playwright image (useful to debug version derivation).           |
-| `installDir`   | Where dependencies are installed: the nearest `package.json` at or above the project. |
+| `playwrightVersion` | The `@playwright/test` version the image is derived from.               |
+| `installDir`   | Where dependencies are installed (see [Dependencies](#dependencies)).        |
+| `packageManager` | The package manager that installs them.                                    |
 | `path`         | The project's config directory, relative to the workspace root.              |
 
 On the test files: `test` (the check, run as one batch over the selection) and
@@ -49,7 +49,7 @@ dagger check playwright/projects/tests/test         # every Playwright project
 dagger check playwright/projects/tests/test --playwright-project=apps/web
 dagger check playwright/projects/tests/test --playwright-project=apps/web \
   --playwright-test-file=tests/login.spec.ts        # one file
-dagger check --playwright --test --playwright-project=apps/web   # as flags
+dagger check --playwright --check test --playwright-project=apps/web   # as flags
 ```
 
 ## Projects
@@ -71,11 +71,11 @@ $ dagger check playwright/projects/tests/test --playwright-project=apps/web --pl
 ```
 
 The selected projects run concurrently, each in its own containers, and a
-failing run lists every run that failed. `--test` alone also selects every
-other installed module's check named `test`; `--playwright` narrows it to
-this one. `dagger check --help` lists the flags in effect:
+failing run lists every run that failed. `--check test` alone also selects
+every other installed module's check named `test`; `--playwright` narrows it
+to this one. `dagger check --help` lists the flags in effect:
 `--playwright-project PATH`, `--playwright-projects`,
-`--playwright-test-file PATH` and `--playwright-test-files`.
+`--playwright-test-file PATH` and `--playwright-tests`.
 
 ### Discovery
 
@@ -117,31 +117,51 @@ The config file is read as text and only **literal** values are honoured:
   are the union across Playwright projects: files are the dimension, not
   browser projects.
 
-The config object must be written as `defineConfig({ … })`,
-`export default { … }` or `module.exports = { … }`. Anything else falls back
-to Playwright's defaults for that setting — `testDir` is the config's
-directory, `testMatch` is `**/*.@(spec|test).?(c|m)[jt]s?(x)`, and nothing is
-ignored:
+The config object is found where the config's default export is:
 
-- values built from variables, environment variables, function calls,
-  template strings with `${}`, or imports;
-- settings that only come from a spread (`...base`), which is ignored;
+- `export default defineConfig({ … })`, `export default { … }` or
+  `module.exports = { … }`;
+- `export default config` (or `defineConfig(config)`) naming a `const` in
+  the same file, TypeScript annotation included
+  (`const config: PlaywrightTestConfig = { … }`);
+- one hop of a relative import: `export { config as default } from
+  '../../utils.js'`, `export default base` with `import base from './base'`.
+
+One identifier spread into the object (`defineConfig({ ...config, webServer
+})`) is read the same way — a `const` in the file or a relative import — and
+the object's own keys override it, as in JavaScript. The imported object's
+own imports and spreads are not followed. A `testDir` in an imported object
+resolves against the config's directory, as Playwright does, unless it uses
+`__dirname`.
+
+Anything else falls back to Playwright's defaults for that setting —
+`testDir` is the config's directory, `testMatch` is
+`**/*.@(spec|test).?(c|m)[jt]s?(x)`, and nothing is ignored:
+
+- values built from variables, environment variables, function calls or
+  template strings with `${}`;
+- imports of packages (not relative paths) and anything more than one hop
+  away;
 - regexes RE2 cannot compile (lookaround, backreferences) and `!(…)` globs;
+- quoted keys (`'testDir': …`);
 - a config that can't be read or doesn't look like the shapes above.
 
-Listing never fails because of a config. Other limits of static discovery:
-empty test files are not listed; `respectGitIgnore` is not applied; and a key
-that Playwright itself does not treat as a test (because of a setting that
-was not read) fails its run with "No tests found".
+Listing never fails because of a config. A project where static discovery
+finds no test file at all still gets one key, `.`, which runs the whole
+project natively, so it can always be checked. Other limits: empty test
+files are not listed; `respectGitIgnore` is not applied; and a key that
+Playwright itself does not treat as a test (because of a setting that was not
+read) fails its run with "No tests found".
 
 ### Whole and filtered runs
 
 A test-file check runs as one batch per project over the selected files:
 
-- **Nothing filtered out** (the whole project, e.g. a bare `dagger check`):
-  Playwright runs the project natively with its own config, split with
-  `--shard=i/N` across N containers, where N is the `shards` setting. Tests
-  static discovery missed still run.
+- **Nothing filtered out** (the whole project, e.g. a bare `dagger check`, or
+  every one of a project's keys selected by name): Playwright runs the
+  project natively with its own config, split with `--shard=i/N` across N
+  containers, where N is the `shards` setting. Tests static discovery missed
+  still run.
 - **Some files selected** (`--playwright-test-file=…`): only those files run.
   Each is passed as an anchored, escaped regex of its absolute path
   (`^/app/apps/web/tests/a\.spec\.ts$`), because Playwright reads positional
@@ -159,8 +179,13 @@ failing shard or group:
 
 ```
 Playwright tests failed in apps/web:
-- tests/a.spec.ts, tests/aa.spec.ts: exit code: 1
+- tests/a.spec.ts, tests/aa.spec.ts: playwright test failed (exit 1):
+  …the end of the output…
 ```
+
+A failing install is named as such (`install failed (pnpm install, exit 1):`
+with the end of its output), and so is a project without Playwright
+installed.
 
 The `runs` function on the test files returns the containers a batch would
 start (`shard` for a whole run, `files` for a group).
@@ -173,6 +198,9 @@ dagger shell playwright/projects/base --playwright-project=apps/web
 # export the HTML report after a failing run
 dagger api call playwright project --path=apps/web report export --path=./playwright-report
 ```
+
+`report` runs the whole project once with `--reporter=list,html`, so the HTML
+report exists whatever reporters the config sets.
 
 ## Working directory awareness
 
@@ -196,10 +224,42 @@ container, with the project directory as the working directory, so
 configuration and dependencies that live above the project — monorepo roots,
 shared configs — keep resolving.
 
-Dependencies are installed at the nearest `package.json` at or above the
-project, so a project without its own `package.json` installs from its
-monorepo root. When the workspace has none at all, the install is skipped
-and `npx` fetches Playwright on demand.
+## Dependencies
+
+Dependencies are installed once per project at its **install root**: the
+nearest workspace root at or above the project (a directory with
+`pnpm-workspace.yaml`, or a `package.json` with `"workspaces"`), else the
+nearest directory with a lockfile, else the nearest `package.json`. So a
+package in a pnpm or yarn workspace gets `workspace:` and `catalog:`
+dependencies, and a project without its own `package.json` installs from its
+monorepo root.
+
+- **Package manager:** the `packageManager` setting, else the install root's
+  `package.json` `"packageManager"` field, else its lockfile
+  (`pnpm-lock.yaml` or `pnpm-workspace.yaml` → pnpm, `yarn.lock` → yarn,
+  `bun.lock` → bun), else npm. pnpm and yarn come from corepack (installed
+  first if the image lacks it), which honours the version in
+  `"packageManager"`.
+- **Caching:** the install step sees only what an install reads — every
+  `package.json`, lockfiles, `pnpm-workspace.yaml`, `.npmrc`/`.yarnrc*`,
+  `.yarn/` releases and plugins, `patches/` — and the rest of the source is
+  laid over it afterwards, so editing a test or source file doesn't re-run
+  the install. The npm, pnpm store, yarn, bun and corepack caches live on
+  cache volumes.
+- **Playwright itself:** tests run the project's own
+  `node_modules/.bin/playwright` (the nearest between the project and the
+  install root, or `yarn playwright` under Plug'n'Play), never a version `npx`
+  fetches. A project without `@playwright/test` installed fails with a message
+  saying where to add it. Only a workspace with no `package.json` at all falls
+  back to `npx playwright`.
+
+The Playwright image is derived from the `@playwright/test` version the
+install root's lockfile resolves (`pnpm-lock.yaml`, `yarn.lock`, `bun.lock`
+or `package-lock.json`), else the version the nearest `package.json` that
+declares it asks for — `catalog:` and `catalog:<name>` resolved from
+`pnpm-workspace.yaml`. A range is read as its lower bound; anything that is
+not a version (`workspace:*`, a URL) falls back to the module's pinned image,
+never to an invalid image reference.
 
 ## Wiring a service under test
 
@@ -252,24 +312,29 @@ tests to use.
 
 ## Settings
 
-Configured under `[modules.playwright.settings]` in `dagger.toml` (or as flags
-on `dagger api call playwright`). They apply to every project:
+Configured under `[modules.playwright.settings]` in `dagger.toml`, or with
+`dagger settings` (`dagger settings playwright shards 2`; `dagger settings -u
+playwright shards` unsets it), or as flags on `dagger api call playwright`.
+They apply to every project:
 
 - **`service`**: DAG address (`"dag://<module>/<function>"`) of the service
   under test.
 - **`serviceHostname`** (default `frontend`): hostname the service is bound as.
 - **`baseImageAddress`** (default: derive): the image tests run in. By default
   it is derived from your project's `@playwright/test` version
-  (`mcr.microsoft.com/playwright:v<version>-noble`), so browsers always match
-  your Playwright version. Derivation prefers the version installed per
-  `package-lock.json`; without a lockfile it falls back to the version
-  declared in `package.json`, so pin that exactly — a floating range like
-  `^1.58.2` can install a newer Playwright than the derived image's browsers.
+  (`mcr.microsoft.com/playwright:v<version>-noble`, see
+  [Dependencies](#dependencies)), so browsers match your Playwright version.
+  Without a lockfile, pin the version exactly — a range like `^1.58.2` can
+  install a newer Playwright than the derived image's browsers.
 - **`baseCtr`**: a full `Container` override, also wireable
-  (`baseCtr = "dag://base-images/chromium"`). `npx playwright` must work in it after
-  dependency install.
-- **`packageManager`** (default `npm`): how project dependencies are installed
-  (`npm`, `yarn`, `pnpm`, `bun`). yarn and pnpm are enabled via corepack.
+  (`baseCtr = "dag://base-images/chromium"`). It needs Node, and the browsers
+  your installed Playwright expects.
+- **`packageManager`** (default: detect): `npm`, `yarn`, `pnpm` or `bun`;
+  empty detects it per project (see [Dependencies](#dependencies)).
+- **`installFlags`** (default `[]`): extra arguments for the install command,
+  e.g. `["--ignore-scripts"]`.
+- **`environment`** (default `[]`): environment variables for the test
+  containers, as `KEY=VALUE`, e.g. `["KIT_E2E_BROWSER=chromium"]`.
 - **`localhostProxy`** (default `false`): see secure contexts above.
 - **`args`** (default `[]`): extra arguments for every `playwright test`
   invocation, e.g. `["--project", "chromium"]`.
@@ -341,7 +406,10 @@ against two minimal Playwright projects — `fixture/`, with
 `.dagger/modules/fixtures`' static server bound as the service under test, and
 `fixture/nested/`, which has no `package.json` of its own and installs from
 the enclosing one. Small synthetic workspaces cover config reading (one
-project per rule) and filtered runs (exact file selection, groups, failures).
+project per rule, including SvelteKit's and React Router's config shapes),
+install roots, package managers and image derivation, installs with pnpm,
+`installFlags` and `environment`, and filtered runs (exact file selection,
+groups, failures).
 `dagger check` exercises discovery (including working-directory scoping),
 lookups, both collections (keys, `get`, `subset`, batches), static config
 reading, whole and filtered runs, version derivation, service wiring, the
