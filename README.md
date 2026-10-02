@@ -251,9 +251,11 @@ monorepo root.
   before the rest of the source is there. A script that builds from source
   fails — reported as `install failed (…, exit N)` with the end of its output
   — or leaves a half-built package. Skip them with
-  `installFlags = ["--ignore-scripts"]` and build as part of the test run
-  instead, e.g. in your config's `webServer.command`
-  (`pnpm build && pnpm preview`), which runs with the full source.
+  `installFlags = ["--ignore-scripts"]` and build with the full source
+  instead: in the `setup` setting (`setup = ["pnpm --filter @acme/sdk
+  build"]`), which runs before the tests, or in your config's
+  `webServer.command` (`pnpm build && pnpm preview`) when no service is
+  wired.
 - **Playwright itself:** tests run the project's own
   `node_modules/.bin/playwright` (the nearest between the project and the
   install root, or `yarn playwright` under Plug'n'Play), never a version `npx`
@@ -316,7 +318,9 @@ localhostProxy = true
 
 This proxies `localhost:<port>` to the service (via socat, installed with apt —
 the default images qualify) and sets `PLAYWRIGHT_LOCALHOST_BASE_URL` for your
-tests to use.
+tests to use. The proxy listens on both `127.0.0.1` and `[::1]` (IPv4 only
+in a container without IPv6), so tests that hardcode a loopback address
+reach the service too.
 
 ## Settings
 
@@ -345,7 +349,13 @@ They apply to every project:
   containers, as `KEY=VALUE`, e.g. `["DEBUG=pw:api"]`.
 - **`localhostProxy`** (default `false`): see secure contexts above.
 - **`args`** (default `[]`): extra arguments for every `playwright test`
-  invocation, e.g. `["--project", "chromium"]`.
+  invocation, e.g. `["--project", "chromium"]`. They come after the module's
+  own arguments, so a flag that takes several values doesn't swallow the
+  file filters.
+- **`setup`** (default `[]`): shell commands run in the project directory
+  after dependencies are installed and the full source is in place, before
+  the tests, e.g. `["pnpm --filter @acme/sdk build"]` to build a workspace
+  package the tests import. They run once per project, shared by its shards.
 - **`shards`** (default `1`): number of parallel containers each project's
   tests run in: `--shard=i/N` for a whole run, up to N groups of files for a
   filtered one (see [Sharding](#sharding)).

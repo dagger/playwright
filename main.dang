@@ -637,6 +637,12 @@ type Playwright {
   """
   shards: Int!
 
+  """
+  Shell commands run in the project directory after the full source is in
+  place and before the tests.
+  """
+  setup: [String!]!
+
   new(
     """
     Base container to use instead of the derived Playwright image
@@ -692,6 +698,13 @@ type Playwright {
     Number of parallel test shards each project's tests run in.
     """
     shards: Int! = 1,
+    """
+    Shell commands run in the project directory after dependencies are
+    installed and the full source is in place, before the tests (e.g.
+    ["pnpm --filter @my/lib build"] to build workspace packages the tests
+    import).
+    """
+    setup: [String!]! = [],
   ) {
     self.baseCtr = baseCtr
     self.service = service
@@ -703,6 +716,7 @@ type Playwright {
     self.localhostProxy = localhostProxy
     self.args = args
     self.shards = shards
+    self.setup = setup
     self
   }
 
@@ -1192,12 +1206,15 @@ type PlaywrightProject {
       let key = pair.replaceMatches(`(?s)=.*$`, with: "")
       acc.withEnvVariable(key, pair.trimPrefix(key + "="))
     }
+    let withSetup = tool.setup.reduce(withEnv) { acc, cmd =>
+      acc.withExec(["sh", "-c", cmd])
+    }
     let svc = tool.service
     if (svc == null) {
-      withEnv
+      withSetup
     } else {
       let host = tool.serviceHostname
-      let bound = withEnv
+      let bound = withSetup
         .withServiceBinding(host, svc)
         .withEnvVariable("PLAYWRIGHT_BASE_URL", `http://${host}:${servicePort}`)
       if (tool.localhostProxy) {
@@ -1237,11 +1254,16 @@ type PlaywrightProject {
     }
     let proxy = if (tool.localhostProxy and tool.service != null) {
       let host = tool.serviceHostname
-      `socat TCP-LISTEN:${servicePort},fork,reuseaddr TCP:${host}:${servicePort} &` + "\n"
+      # Dual-stack, so both 127.0.0.1 and [::1] reach the service; IPv4 only
+      # where the container has no IPv6.
+      `(socat TCP6-LISTEN:${servicePort},ipv6only=0,fork,reuseaddr TCP:${host}:${servicePort} || socat TCP-LISTEN:${servicePort},fork,reuseaddr TCP:${host}:${servicePort}) &` + "\n"
     } else {
       ""
     }
-    ["sh", "-c", proxy + run, "playwright"] + tool.args + extra
+    # args go last: a variadic flag in them (--project web) would swallow
+    # file filters that came after it, and Playwright ignores filters after
+    # "--".
+    ["sh", "-c", proxy + run, "playwright"] + extra + tool.args
   }
 
   # Playwright reads each positional argument as a case-insensitive regexp
