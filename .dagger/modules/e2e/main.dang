@@ -1,18 +1,622 @@
 """
 End-to-end checks for the playwright toolchain.
+
+The in-repo fixture holds two projects: `fixture` (served by the fixtures
+module's static server) and `fixture/nested` (self-contained, no package.json
+of its own).
 """
 type E2e {
+  let assert(condition: Boolean!, message: String!): Void {
+    if (condition == false) { raise message }
+    null
+  }
+
   """
-  Run the toolchain's test suite against the in-repo fixture project,
-  exercising service wiring, the localhost secure-context proxy, and
-  sharding.
+  Run a check, raising its failure. A check called through a dependency comes
+  back as a Check that has not run.
+  """
+  let run(check: Check!): Void {
+    # Check.error is not null for a passing check when read from Dang, so ask
+    # pass first and read the message only on failure.
+    if (check.pass == false) {
+      raise check.error.message ?? "check failed"
+    }
+    null
+  }
+
+  # Whether a check fails when run.
+  let failed(check: Check!): Boolean! {
+    check.pass == false
+  }
+
+  # The workspace with its working directory at the root, so keys and lookups
+  # don't depend on where `dagger check` was invoked.
+  let root(ws: Workspace!): Workspace! { ws.withWorkdir(".") }
+
+  # The toolchain as the fixture project needs it: the fixture server wired
+  # in, the localhost proxy on, and two shards.
+  let wired: Playwright! {
+    playwright(service: fixtures.server, localhostProxy: true, shards: 2)
+  }
+
+  """
+  Run the fixture project with a bound service, the localhost proxy and two shards.
   """
   checkFixture(ws: Workspace!): Void @check {
-    playwright(
-      ws,
-      service: fixtures.server,
-      localhostProxy: true,
-      shards: 2,
-    ).test
+    let w = root(ws)
+    let project = wired.projects(w).get(key: "fixture")
+    let ctr = project.base(w)
+    assert(
+      ctr.envVariable("PLAYWRIGHT_BASE_URL") == "http://frontend:8080",
+      "PLAYWRIGHT_BASE_URL does not point at the bound service",
+    )
+    assert(
+      ctr.envVariable("PLAYWRIGHT_LOCALHOST_BASE_URL") == "http://localhost:8080",
+      "PLAYWRIGHT_LOCALHOST_BASE_URL is not set",
+    )
+    # The whole project runs natively, one container per shard.
+    let tests = project.tests(w)
+    let shards = tests.batch.runs.{{shard, files}}
+    assert(
+      shards.map { r => r.shard }.join(",") == "1/2,2/2",
+      "a whole run is not one run per shard: " + shards.map { r => r.shard }.join(","),
+    )
+    run(tests.batch.test(w))
+    null
+  }
+
+  """
+  Discovery keys projects by config directory, scoped by the working directory.
+  """
+  discoveryCheck(ws: Workspace!): Void @check {
+    let w = root(ws)
+    let keys = playwright.projects(w).keys.join(",")
+    assert(keys == "fixture,fixture/nested", "unexpected keys from the root: " + keys)
+
+    let synthetic = w
+      .withNewFile("synthetic/b/playwright.config.mjs", "")
+      .withNewFile("synthetic/a/playwright.config.cts", "")
+      .withNewFile("synthetic/a/playwright.config.ts", "")
+      .withNewFile("fixture/node_modules/dep/playwright.config.js", "")
+      .withNewFile("fixture/.cache/playwright.config.ts", "")
+    let all = playwright.projects(synthetic).keys.join(",")
+    assert(
+      all == "fixture,fixture/nested,synthetic/a,synthetic/b",
+      "unexpected keys in a synthetic workspace: " + all,
+    )
+
+    # At a project root: that project and the ones below it, no ancestors.
+    let atRoot = playwright.projects(w.withWorkdir("fixture")).keys.join(",")
+    assert(atRoot == "fixture,fixture/nested", "unexpected keys from fixture: " + atRoot)
+    let nested = playwright.projects(w.withWorkdir("fixture/nested")).keys.join(",")
+    assert(nested == "fixture/nested", "discovery from a project escaped its subtree: " + nested)
+
+    # Inside a project's subdirectory: exactly the enclosing project.
+    let inside = playwright.projects(w.withWorkdir("fixture/tests")).keys.join(",")
+    assert(inside == "fixture", "discovery inside a project missed its enclosing config: " + inside)
+    let deeper = playwright.projects(w.withWorkdir("fixture/nested/tests")).keys.join(",")
+    assert(deeper == "fixture/nested", "discovery did not pick the nearest enclosing project: " + deeper)
+
+    # Outside any project: only the projects below.
+    let outside = playwright.projects(synthetic.withWorkdir("synthetic")).keys.join(",")
+    assert(outside == "synthetic/a,synthetic/b", "unexpected keys outside any project: " + outside)
+    let none = playwright.projects(w.withWorkdir(".dagger")).keys.length
+    assert(none == 0, "found projects where there are none")
+
+    # Test files are keyed relative to their project, whatever the cwd.
+    let files = playwright.projects(w).get(key: "fixture").tests(w).keys.join(",")
+    assert(files == "tests/smoke.spec.ts", "unexpected test files in fixture: " + files)
+    let deep = w.withWorkdir("fixture/tests")
+    let fromTests = playwright.projects(deep).get(key: "fixture").tests(deep).keys.join(",")
+    assert(fromTests == files, "test file keys depend on the cwd: " + fromTests)
+    let nestedFiles = playwright.projects(w).get(key: "fixture/nested").tests(w).keys.join(",")
+    assert(nestedFiles == "tests/nested.spec.ts", "unexpected test files in fixture/nested: " + nestedFiles)
+    null
+  }
+
+  """
+  The project lookup resolves the project containing a path.
+  """
+  lookupCheck(ws: Workspace!): Void @check {
+    let w = root(ws)
+    assert(playwright.project(w, "fixture/tests").path == "fixture", "lookup missed the enclosing project")
+    assert(playwright.project(w, "fixture/nested").path == "fixture/nested", "lookup missed the nearest project")
+    assert(
+      playwright.project(w.withWorkdir("fixture"), "nested").path == "fixture/nested",
+      "lookup did not resolve relative to the working directory",
+    )
+    assert(
+      playwright.project(w.withWorkdir("fixture/nested"), "/fixture").path == "fixture",
+      "lookup did not resolve an absolute path from the workspace root",
+    )
+    let missing = {
+      playwright.project(w, ".").path
+    } rescue {
+      err: Error => err.message
+    }
+    assert(missing.contains("no playwright.config"), "missing project did not fail clearly: " + missing)
+    null
+  }
+
+  """
+  Dependencies install from the nearest package.json, which also picks the image.
+  """
+  installCheck(ws: Workspace!): Void @check {
+    let w = root(ws)
+    let projects = playwright.projects(w)
+    let image = "mcr.microsoft.com/playwright:v1.58.2-noble"
+    assert(projects.get(key: "fixture").installDir(w) == "fixture", "fixture installs elsewhere")
+    assert(
+      projects.get(key: "fixture/nested").installDir(w) == "fixture",
+      "nested project does not install from the enclosing package.json",
+    )
+    assert(projects.get(key: "fixture/nested").imageAddress(w) == image, "nested image not derived")
+    let bare = w.withNewFile("synthetic/playwright.config.ts", "")
+    assert(
+      playwright.projects(bare).get(key: "synthetic").installDir(bare) == null,
+      "invented an install dir",
+    )
+    assert(
+      playwright(baseImageAddress: "example.com/pw:1").project(w, "fixture").imageAddress(w) == "example.com/pw:1",
+      "baseImageAddress was not honored",
+    )
+    null
+  }
+
+  """
+  The projects and test-file collections support get, subset and batches.
+  """
+  collectionCheck(ws: Workspace!): Void @check {
+    let w = root(ws)
+    # Unwired: `fixture` needs the server and fails, `fixture/nested` doesn't.
+    let projects = playwright.projects(w)
+    let only = projects.subset(keys: ["fixture/nested"])
+    assert(only.keys.join(",") == "fixture/nested", "subset kept other keys")
+    assert(only.get(key: "fixture/nested").path == "fixture/nested", "get inside a subset failed")
+    let outside = {
+      only.get(key: "fixture").path
+    } rescue {
+      err: Error => "rejected"
+    }
+    assert(outside == "rejected", "get outside a subset succeeded")
+    let unknown = {
+      projects.subset(keys: ["nope"]).keys.join(",")
+    } rescue {
+      err: Error => "rejected"
+    }
+    assert(unknown == "rejected", "subset accepted an unknown key")
+    let duplicate = {
+      projects.subset(keys: ["fixture", "fixture"]).keys.join(",")
+    } rescue {
+      err: Error => "rejected"
+    }
+    assert(duplicate == "rejected", "subset accepted a duplicate key")
+    let empty: [String!]! = []
+    assert(projects.subset(keys: empty).keys.length == 0, "empty subset is not empty")
+
+    # The failing project is outside the subset, so this passes only if the
+    # batch ran just its own keys.
+    only.batch.test(w)
+
+    # The whole collection reports the failing project, and only it.
+    let failure = {
+      projects.batch.test(w)
+      "unexpected success"
+    } rescue {
+      err: Error => err.message
+    }
+    assert(failure.contains("- fixture:"), "batch did not report the failing project: " + failure)
+    assert(failure.contains("- fixture/nested:") == false, "batch reported a passing project: " + failure)
+
+    # With every project failing, the batch reports all of them.
+    let both = {
+      playwright(args: ["--bogus-option"]).projects(w).batch.test(w)
+      "unexpected success"
+    } rescue {
+      err: Error => err.message
+    }
+    assert(
+      both.contains("- fixture:") and both.contains("- fixture/nested:"),
+      "batch did not report every failing project: " + both,
+    )
+
+    # The test files of a project are a collection too.
+    let tests = synthetic.projects(syntheticWs).get(key: "defaults").tests(syntheticWs)
+    assert(tests.keys.join(",") == "a.spec.ts,b.test.mjs,sub/d.spec.tsx", "unexpected keys: " + tests.keys.join(","))
+    let pair = tests.subset(keys: ["sub/d.spec.tsx", "a.spec.ts"])
+    assert(pair.keys.join(",") == "a.spec.ts,sub/d.spec.tsx", "subset did not keep collection order: " + pair.keys.join(","))
+    assert(pair.get(key: "a.spec.ts").path == "a.spec.ts", "get inside a subset failed")
+    let outsideFile = {
+      pair.get(key: "b.test.mjs").path
+    } rescue {
+      err: Error => "rejected"
+    }
+    assert(outsideFile == "rejected", "get outside a subset succeeded")
+    let unknownFile = {
+      tests.subset(keys: ["nope.spec.ts"]).keys.join(",")
+    } rescue {
+      err: Error => "rejected"
+    }
+    assert(unknownFile == "rejected", "subset accepted an unknown test file")
+    let duplicateFile = {
+      tests.subset(keys: ["a.spec.ts", "a.spec.ts"]).keys.join(",")
+    } rescue {
+      err: Error => "rejected"
+    }
+    assert(duplicateFile == "rejected", "subset accepted a duplicate test file")
+    let noFiles = tests.subset(keys: empty)
+    assert(noFiles.keys.length == 0, "empty subset is not empty")
+    assert(noFiles.batch.runs.{{shard}}.length == 0, "an empty subset plans runs")
+    run(noFiles.batch.test(syntheticWs))
+    null
+  }
+
+  """
+  The batch tests every project against the wired service, and report works.
+  """
+  batchCheck(ws: Workspace!): Void @check {
+    let w = root(ws)
+    wired.projects(w).batch.test(w)
+    let report = playwright.project(w, "fixture").report(w)
+    assert(report.entries.contains("index.html"), "report has no index.html")
+    null
+  }
+
+  # A small synthetic workspace of projects, one per config-reading rule.
+  # Search skips empty files, so every file has content.
+  let syntheticWs: Workspace! {
+    let body = "export {};\n"
+    directory
+      # Defaults: testDir is the config directory, the default testMatch, no
+      # node_modules, and a nested project keeps its own files.
+      .withNewFile("defaults/playwright.config.ts", "export default {};\n")
+      .withNewFile("defaults/a.spec.ts", body)
+      .withNewFile("defaults/b.test.mjs", body)
+      .withNewFile("defaults/c.ts", body)
+      .withNewFile("defaults/sub/d.spec.tsx", body)
+      .withNewFile("defaults/node_modules/x/e.spec.ts", body)
+      .withNewFile("defaults/inner/playwright.config.js", "module.exports = {};\n")
+      .withNewFile("defaults/inner/f.spec.js", body)
+      # A literal testDir.
+      .withNewFile(
+        "testdir/playwright.config.ts",
+        "import { defineConfig } from '@playwright/test';\n// testDir: 'nope'\nexport default defineConfig({\n  testDir: './e2e',\n  use: { baseURL: 'http://x:1/' },\n});\n",
+      )
+      .withNewFile("testdir/e2e/a.spec.ts", body)
+      .withNewFile("testdir/other/b.spec.ts", body)
+      # path.join(__dirname, ...).
+      .withNewFile(
+        "joined/playwright.config.ts",
+        "import path from 'path';\nexport default defineConfig({ testDir: path.join(__dirname, 'e2e') });\n",
+      )
+      .withNewFile("joined/e2e/a.spec.ts", body)
+      .withNewFile("joined/b.spec.ts", body)
+      # A testMatch glob.
+      .withNewFile("glob/playwright.config.ts", "export default defineConfig({ testMatch: '*.e2e.ts' });\n")
+      .withNewFile("glob/x.e2e.ts", body)
+      .withNewFile("glob/y.spec.ts", body)
+      # A testMatch array of a glob and a regex.
+      .withNewFile(
+        "array/playwright.config.ts",
+        "export default defineConfig({ testMatch: ['a/*.ts', /b\\.check\\.js$/] });\n",
+      )
+      .withNewFile("array/a/one.ts", body)
+      .withNewFile("array/a/deep/two.ts", body)
+      .withNewFile("array/b.check.js", body)
+      .withNewFile("array/c.spec.ts", body)
+      # A testMatch regex.
+      .withNewFile("regex/playwright.config.js", "module.exports = { testMatch: /.*\\.pw\\.ts$/i };\n")
+      .withNewFile("regex/x.PW.ts", body)
+      .withNewFile("regex/y.spec.ts", body)
+      # testIgnore.
+      .withNewFile("ignored/playwright.config.ts", "export default defineConfig({ testIgnore: '**/skip/**' });\n")
+      .withNewFile("ignored/a.spec.ts", body)
+      .withNewFile("ignored/skip/b.spec.ts", body)
+      # Playwright projects with their own testDir: keys are the union.
+      .withNewFile(
+        "projects/playwright.config.ts",
+        "export default defineConfig({\n  testDir: 'shared',\n  projects: [\n    { name: 'a', use: { ...devices['Desktop Chrome'] } },\n    { name: 'b', testDir: './b-tests' },\n  ],\n});\n",
+      )
+      .withNewFile("projects/shared/s.spec.ts", body)
+      .withNewFile("projects/b-tests/t.spec.ts", body)
+      .withNewFile("projects/other/o.spec.ts", body)
+      # Non-literal values fall back to the defaults.
+      .withNewFile(
+        "dynamic/playwright.config.ts",
+        "const dir = process.env.DIR;\nexport default defineConfig({ testDir: dir, testMatch: process.env.MATCH });\n",
+      )
+      .withNewFile("dynamic/a.spec.ts", body)
+      .withNewFile("dynamic/e2e/b.spec.ts", body)
+      # A regex RE2 can't compile falls back to the default testMatch.
+      .withNewFile("lookaround/playwright.config.ts", "export default defineConfig({ testMatch: /(?<=x)y\\.ts/ });\n")
+      .withNewFile("lookaround/a.spec.ts", body)
+      .withNewFile("lookaround/xy.ts", body)
+      # A config that isn't JavaScript falls back to the defaults.
+      .withNewFile("broken/playwright.config.ts", "this is {{ not ( javascript\n")
+      .withNewFile("broken/a.spec.ts", body)
+      # SvelteKit's shapes: a shared config in ../../utils.js, spread into
+      # defineConfig({...config, webServer}) or re-exported as the default.
+      .withNewFile(
+        "kit/test/utils.js",
+        "import { defineConfig } from '@playwright/test';\nexport const port = 4173;\nif (!port) throw new Error(`no port for ${process.env.NAME}`);\n// a comment that doesn't close a `template`\nexport const config = defineConfig({\n  forbidOnly: !!process.env.CI,\n  projects: process.env.P ? all.filter((p) => p) : all,\n  reporter: 'list',\n  testDir: 'test',\n  testMatch: /(.+\\.)?(test|spec)\\.[jt]s/\n});\n",
+      )
+      .withNewFile(
+        "kit/test/apps/basics/playwright.config.js",
+        "import process from 'node:process';\nimport { config, port } from '../../utils.js';\nimport { defineConfig } from '@playwright/test';\n\nexport default defineConfig({\n\t...config,\n\twebServer: {\n\t\t...config.webServer,\n\t\tcommand: process.env.DEV ? `pnpm dev --port ${port}` : 'pnpm preview',\n\t\tport\n\t}\n});\n",
+      )
+      .withNewFile("kit/test/apps/basics/test/client.test.js", body)
+      .withNewFile("kit/test/apps/basics/test/test.js", body)
+      .withNewFile("kit/test/apps/basics/src/build.test.js", body)
+      .withNewFile(
+        "kit/test/apps/adapter/playwright.config.js",
+        "export { config as default } from '../../utils.js';\n",
+      )
+      .withNewFile("kit/test/apps/adapter/test/test.js", body)
+      .withNewFile("kit/test/apps/adapter/src/unit.spec.js", body)
+      .withNewFile(
+        "kit/test/apps/override/playwright.config.js",
+        "import { config as base } from '../../utils.js';\nexport default {\n  ...base,\n  testIgnore: '**/skip/**',\n};\n",
+      )
+      .withNewFile("kit/test/apps/override/test/a.test.js", body)
+      .withNewFile("kit/test/apps/override/test/skip/b.test.js", body)
+      # React Router's shape: a typed const exported by name.
+      .withNewFile(
+        "rr/integration/playwright.config.ts",
+        "import type { PlaywrightTestConfig } from '@playwright/test';\nlet workers = 2;\nconst config: PlaywrightTestConfig = {\n  testDir: '.',\n  testMatch: ['**/*-test.ts'],\n  timeout: 30_000,\n  workers,\n  projects: [\n    { name: 'chromium', use: devices['Desktop Chrome'] },\n    { name: 'msedge', use: { ...devices['Desktop Edge'], channel: 'msedge' } },\n  ],\n};\n\nexport default config;\n",
+      )
+      .withNewFile("rr/integration/a-test.ts", body)
+      .withNewFile("rr/integration/helpers/b-test.ts", body)
+      .withNewFile("rr/integration/c.spec.ts", body)
+      # Nothing to find statically: the project still gets the "." key.
+      .withNewFile(
+        "opaque/playwright.config.ts",
+        "const match = '**/*.e2e.ts';\nexport default defineConfig({ testMatch: match });\n",
+      )
+      .withNewFile("opaque/a.e2e.ts", body)
+      .asWorkspace
+  }
+
+  let synthetic: Playwright! { playwright }
+
+  """
+  Test files follow the literal testDir, testMatch and testIgnore in each config.
+  """
+  configCheck: Void @check {
+    let ws = syntheticWs
+    let projects = synthetic.projects(ws)
+    let expect(project: String!, want: String!): Void {
+      let got = projects.get(key: project).tests(ws).keys.join(",")
+      assert(got == want, project + ": got " + got + ", want " + want)
+    }
+    expect("defaults", "a.spec.ts,b.test.mjs,sub/d.spec.tsx")
+    expect("defaults/inner", "f.spec.js")
+    expect("testdir", "e2e/a.spec.ts")
+    expect("joined", "e2e/a.spec.ts")
+    expect("glob", "x.e2e.ts")
+    expect("array", "a/one.ts,b.check.js")
+    expect("regex", "x.PW.ts")
+    expect("ignored", "a.spec.ts")
+    expect("projects", "b-tests/t.spec.ts,shared/s.spec.ts")
+    expect("dynamic", "a.spec.ts,e2e/b.spec.ts")
+    expect("lookaround", "a.spec.ts")
+    expect("broken", "a.spec.ts")
+    expect("kit/test/apps/basics", "test/client.test.js,test/test.js")
+    expect("kit/test/apps/adapter", "test/test.js")
+    expect("kit/test/apps/override", "test/a.test.js")
+    expect("rr/integration", "a-test.ts,helpers/b-test.ts")
+    expect("opaque", ".")
+
+    # Keys don't depend on the cwd.
+    let inside = ws.withWorkdir("testdir/e2e")
+    let fromInside = synthetic.projects(inside).get(key: "testdir").tests(inside).keys.join(",")
+    assert(fromInside == "e2e/a.spec.ts", "keys changed with the cwd: " + fromInside)
+    null
+  }
+
+  # A project whose tests need no browser or service: a.spec.ts passes and
+  # aa.spec.ts fails (a filter for "a.spec.ts" alone would also match it),
+  # b, c and d pass.
+  let runWs: Workspace! {
+    let pass = "import { test, expect } from '@playwright/test';\ntest('passes', () => { expect(1).toBe(1); });\n"
+    let fail = "import { test, expect } from '@playwright/test';\ntest('fails', () => { expect(1).toBe(2); });\n"
+    directory
+      .withNewFile(
+        "runs/package.json",
+        "{ \"name\": \"runs\", \"private\": true, \"devDependencies\": { \"@playwright/test\": \"1.58.2\" } }\n",
+      )
+      .withNewFile("runs/playwright.config.ts", "import { defineConfig } from '@playwright/test';\nexport default defineConfig({ testDir: 'tests' });\n")
+      .withNewFile("runs/tests/a.spec.ts", pass)
+      .withNewFile("runs/tests/aa.spec.ts", fail)
+      .withNewFile("runs/tests/b.spec.ts", pass)
+      .withNewFile("runs/tests/c.spec.ts", pass)
+      .withNewFile("runs/tests/d.spec.ts", pass)
+      # Found by nothing static: its one key, ".", runs the whole project.
+      .withNewFile(
+        "runs/whole/playwright.config.ts",
+        "import { defineConfig } from '@playwright/test';\nconst match = '**/*.e2e.ts';\nexport default defineConfig({ testMatch: match });\n",
+      )
+      .withNewFile("runs/whole/a.e2e.ts", pass)
+      .asWorkspace
+  }
+
+  """
+  Filtered runs select exactly their files in groups; whole runs shard the project.
+  """
+  runCheck: Void @check {
+    let ws = runWs
+    let tests = playwright(shards: 2).projects(ws).get(key: "runs").tests(ws)
+    let a = "tests/a.spec.ts"
+    let aa = "tests/aa.spec.ts"
+    assert(
+      tests.keys.join(",") == "tests/a.spec.ts,tests/aa.spec.ts,tests/b.spec.ts,tests/c.spec.ts,tests/d.spec.ts",
+      "unexpected keys: " + tests.keys.join(","),
+    )
+
+    # Exactly one file, though its name is a substring of a failing one.
+    run(tests.subset(keys: [a]).batch.test(ws))
+    run(tests.get(key: a).test(ws))
+    assert(failed(tests.get(key: aa).test(ws)), "the failing file passed on its own")
+
+    # More files than shards: two groups, in order, each its own container.
+    let three = tests.subset(keys: [a, "tests/b.spec.ts", "tests/c.spec.ts"])
+    let groups = three.batch.runs.{{files, shard}}.map { r => r.files.join("+") }.join(" | ")
+    assert(groups == "tests/a.spec.ts+tests/b.spec.ts | tests/c.spec.ts", "unexpected groups: " + groups)
+    run(three.batch.test(ws))
+
+    # A failing group is reported, and only that group.
+    let failure = {
+      run(tests.subset(keys: [a, aa]).batch.test(ws))
+      "unexpected success"
+    } rescue {
+      err: Error => err.message
+    }
+    assert(failure.contains("- tests/aa.spec.ts:"), "the failing group was not reported: " + failure)
+    assert(failure.contains("- tests/a.spec.ts:") == false, "a passing group was reported: " + failure)
+
+    # The whole run is one container per shard, and it fails.
+    let whole = tests.batch.runs.{{files, shard}}
+    assert(
+      whole.map { r => r.shard }.join(",") == "1/2,2/2",
+      "a whole run is not one run per shard: " + whole.map { r => r.shard }.join(","),
+    )
+    assert(failed(tests.batch.test(ws)), "the whole run missed the failing file")
+
+    # A project static discovery can't read runs whole through its "." key.
+    let opaque = playwright.projects(ws).get(key: "runs/whole").tests(ws)
+    assert(opaque.keys.join(",") == ".", "unexpected keys: " + opaque.keys.join(","))
+    run(opaque.get(key: ".").test(ws))
+
+    # report adds the html reporter, which this config doesn't configure.
+    let report = playwright.projects(ws).get(key: "runs").report(ws)
+    assert(report.entries.contains("index.html"), "report has no index.html")
+    null
+  }
+
+  # A file's text for a synthetic workspace.
+  let packageJson(fields: String!): String! {
+    "{ \"private\": true" + fields + " }\n"
+  }
+
+  """
+  Package manager, install root and Playwright version come from the
+  workspace: packageManager fields, lockfiles and pnpm catalogs.
+  """
+  imageCheck: Void @check {
+    let config = "export default {};\n"
+    let ws = directory
+      # A pnpm workspace whose app takes @playwright/test from the catalog.
+      .withNewFile("pnpm/package.json", packageJson(", \"packageManager\": \"pnpm@9.15.0\""))
+      .withNewFile(
+        "pnpm/pnpm-workspace.yaml",
+        "packages:\n  - 'apps/*'\ncatalog:\n  '@playwright/test': ^1.60.0\n  vite: ^7.0.0\ncatalogs:\n  e2e:\n    '@playwright/test': 1.59.1\n",
+      )
+      .withNewFile("pnpm/apps/web/package.json", packageJson(", \"devDependencies\": { \"@playwright/test\": \"catalog:\" }"))
+      .withNewFile("pnpm/apps/web/playwright.config.ts", config)
+      .withNewFile("pnpm/apps/named/package.json", packageJson(", \"devDependencies\": { \"@playwright/test\": \"catalog:e2e\" }"))
+      .withNewFile("pnpm/apps/named/playwright.config.ts", config)
+      # The same, locked: the lockfile's version wins, even for an app that
+      # doesn't declare @playwright/test itself.
+      .withNewFile("locked/package.json", packageJson(", \"devDependencies\": { \"@playwright/test\": \"catalog:\" }"))
+      .withNewFile("locked/pnpm-workspace.yaml", "packages:\n  - 'apps/*'\ncatalog:\n  '@playwright/test': ^1.62.1\n")
+      .withNewFile(
+        "locked/pnpm-lock.yaml",
+        "lockfileVersion: '9.0'\nimporters:\n  .:\n    devDependencies:\n      '@playwright/test':\n        specifier: 'catalog:'\n        version: 1.63.0\npackages:\n  '@playwright/test@1.63.0':\n    resolution: {integrity: sha512-x}\n",
+      )
+      .withNewFile("locked/apps/site/package.json", packageJson(""))
+      .withNewFile("locked/apps/site/playwright.config.ts", config)
+      # yarn.lock and a workspaces field.
+      .withNewFile("yarn/package.json", packageJson(", \"workspaces\": [\"e2e\"]"))
+      .withNewFile(
+        "yarn/yarn.lock",
+        "\"@playwright/test@npm:^1.50.0\":\n  version: 1.50.1\n  resolution: \"@playwright/test@npm:1.50.1\"\n",
+      )
+      .withNewFile("yarn/e2e/package.json", packageJson(", \"devDependencies\": { \"@playwright/test\": \"^1.50.0\" }"))
+      .withNewFile("yarn/e2e/playwright.config.ts", config)
+      # A specifier that is no version at all falls back cleanly.
+      .withNewFile("odd/package.json", packageJson(", \"devDependencies\": { \"@playwright/test\": \"workspace:*\" }"))
+      .withNewFile("odd/playwright.config.ts", config)
+      .asWorkspace
+    let projects = playwright.projects(ws)
+    let check(key: String!, root: String!, pm: String!, image: String!): Void {
+      let project = projects.get(key: key)
+      let gotRoot = project.installDir(ws) ?? "none"
+      assert(gotRoot == root, key + ": install root " + gotRoot + ", want " + root)
+      let gotPm = project.packageManager(ws)
+      assert(gotPm == pm, key + ": package manager " + gotPm + ", want " + pm)
+      let gotImage = project.imageAddress(ws)
+      assert(gotImage == image, key + ": image " + gotImage + ", want " + image)
+    }
+    let pw = "mcr.microsoft.com/playwright:v"
+    check("pnpm/apps/web", "pnpm", "pnpm", pw + "1.60.0-noble")
+    check("pnpm/apps/named", "pnpm", "pnpm", pw + "1.59.1-noble")
+    check("locked/apps/site", "locked", "pnpm", pw + "1.63.0-noble")
+    check("yarn/e2e", "yarn", "yarn", pw + "1.50.1-noble")
+    check("odd", "odd", "npm", pw + "1.58.2-noble")
+    assert(
+      playwright(packageManager: "bun").projects(ws).get(key: "yarn/e2e").packageManager(ws) == "bun",
+      "the packageManager setting did not win",
+    )
+    null
+  }
+
+  # Failure text of a check, or "passed".
+  let failure(check: Check!): String! {
+    if (check.pass) { "passed" } else { check.error.message ?? "failed" }
+  }
+
+  """
+  Installs use pnpm via corepack, copy file: deps, link bins, name failures; environment applies.
+  """
+  installRunCheck: Void @check {
+    let pass = "import { test, expect } from '@playwright/test';\ntest('env', () => { expect(process.env.GREETING).toBe('hello=world'); });\n"
+    let usesBin = "import { test, expect } from '@playwright/test';\nimport { execFileSync } from 'node:child_process';\ntest('bin', () => { expect(execFileSync('node_modules/.bin/greet').toString().trim()).toBe('hi from tool'); });\n"
+    let usesDep = "import { test, expect } from '@playwright/test';\nimport dep from 'local-dep';\ntest('dep', () => { expect(dep.answer).toBe(42); });\n"
+    let ws = directory
+      # pnpm workspace, with @playwright/test from the catalog.
+      .withNewFile("pnpm/package.json", packageJson(", \"packageManager\": \"pnpm@9.15.0\""))
+      .withNewFile(
+        "pnpm/pnpm-workspace.yaml",
+        "packages:\n  - 'apps/*'\n  - 'packages/*'\ncatalog:\n  '@playwright/test': 1.58.2\n",
+      )
+      # A workspace package with a bin, which the install must see to link.
+      .withNewFile(
+        "pnpm/packages/tool/package.json",
+        "{ \"name\": \"tool\", \"version\": \"1.0.0\", \"bin\": { \"greet\": \"bin/greet.js\" } }\n",
+      )
+      .withNewFile("pnpm/packages/tool/bin/greet.js", "#!/usr/bin/env node\nconsole.log('hi from tool');\n")
+      .withNewFile("pnpm/apps/web/bin.spec.ts", usesBin)
+      .withNewFile(
+        "pnpm/apps/web/package.json",
+        packageJson(
+          ", \"devDependencies\": { \"@playwright/test\": \"catalog:\", \"local-dep\": \"file:./local-dep\", \"tool\": \"workspace:*\" }",
+        ),
+      )
+      .withNewFile("pnpm/apps/web/playwright.config.ts", "export default {};\n")
+      .withNewFile("pnpm/apps/web/env.spec.ts", pass)
+      # pnpm copies file: dependencies at install time, so the install needs
+      # the directory, not only its package.json.
+      .withNewFile("pnpm/apps/web/local-dep/package.json", "{ \"name\": \"local-dep\", \"version\": \"1.0.0\", \"main\": \"index.js\" }\n")
+      .withNewFile("pnpm/apps/web/local-dep/index.js", "module.exports = { answer: 42 };\n")
+      .withNewFile("pnpm/apps/web/dep.spec.ts", usesDep)
+      # No @playwright/test, and a postinstall that fails.
+      .withNewFile("bare/package.json", packageJson(", \"scripts\": { \"postinstall\": \"exit 3\" }"))
+      .withNewFile("bare/playwright.config.ts", "export default {};\n")
+      .withNewFile("bare/a.spec.ts", pass)
+      .asWorkspace
+    let tool = playwright(environment: ["GREETING=hello=world"])
+    run(tool.projects(ws).get(key: "pnpm/apps/web").tests(ws).batch.test(ws))
+
+    let broken = failure(
+      tool.projects(ws).get(key: "bare").tests(ws).batch.test(ws),
+    )
+    assert(broken.contains("install failed (npm install, exit"), "the install failure was not named: " + broken)
+    let missing = failure(
+      playwright(installFlags: ["--ignore-scripts"]).projects(ws).get(key: "bare").tests(ws).batch.test(ws),
+    )
+    assert(
+      missing.contains("@playwright/test is not installed"),
+      "a project without Playwright did not fail clearly: " + missing,
+    )
+    null
   }
 }

@@ -3,6 +3,16 @@ pub description = "Run Playwright browser tests against your project, with works
 # Fallback image when the project's @playwright/test version can't be derived.
 let fallbackImage = "mcr.microsoft.com/playwright:v1.58.2-noble"
 
+# Basenames that mark a Playwright project directory.
+let configNames: [String!]! = [
+  "playwright.config.ts",
+  "playwright.config.js",
+  "playwright.config.mjs",
+  "playwright.config.cjs",
+  "playwright.config.mts",
+  "playwright.config.cts",
+]
+
 # range returns [1, 2, ..., n]
 let range(n: Int!): [Int!]! {
   if (n <= 0) {
@@ -12,54 +22,573 @@ let range(n: Int!): [Int!]! {
   }
 }
 
-# workspacePath resolves a project path — cwd-relative, or absolute from the
-# workspace root — to a root-absolute path ("/" is the workspace root).
-let workspacePath(cwd: String!, p: String!): String! {
-  if (p.hasPrefix("/")) {
-    p
-  } else if (p == "" or p == ".") {
-    cwd
-  } else {
-    cwd.trimSuffix("/") + "/" + p
+# sorted orders strings bytewise, so keys (and their cache keys) are stable.
+let sorted(items: [String!]!): [String!]! {
+  let empty: [String!]! = []
+  items.reduce(empty) { acc, item =>
+    acc.takeWhile { x => x <= item } + [item] + acc.dropWhile { x => x <= item }
   }
 }
 
-# installDirFor returns the directory holding the nearest package.json at or
-# above the project path, or null when the workspace has none.
-let installDirFor(ws: Workspace!, path: String!): String {
-  let pkg = ws.findUp("package.json", from: path)
-  if (pkg == null) {
-    null
+# rootPath resolves a path — cwd-relative, or absolute from the workspace
+# root — to a workspace-root-relative path ("." is the workspace root).
+let rootPath(cwd: String!, p: String!): String! {
+  let start = if (p.hasPrefix("/")) {
+    [] :: [String!]!
   } else {
-    let dir = pkg.trimSuffix("package.json").trimSuffix("/")
-    if (dir == "") { "/" } else { dir }
+    cwd.split("/").filter { s => s != "" and s != "." }
+  }
+  let segments = p.split("/").reduce(start) { acc, seg =>
+    if (seg == "" or seg == ".") {
+      acc
+    } else if (seg == "..") {
+      acc.dropLast(1)
+    } else {
+      acc + [seg]
+    }
+  }
+  if (segments.length == 0) { "." } else { segments.join("/") }
+}
+
+# wsPath turns a root-relative path into the absolute form the Workspace API
+# resolves from the workspace root.
+let wsPath(p: String!): String! {
+  if (p == ".") { "/" } else { "/" + p }
+}
+
+# appPath is where a root-relative path lives inside the test container.
+let appPath(p: String!): String! {
+  if (p == ".") { "/app" } else { "/app/" + p }
+}
+
+# dirOf returns the root-relative directory of an absolute workspace path
+# returned by findUp ("/fixture/package.json" → "fixture").
+let dirOf(found: String!): String! {
+  let dir = found.trimPrefix("/").split("/").dropLast(1).join("/")
+  if (dir == "") { "." } else { dir }
+}
+
+# depth counts a root-relative path's segments; the root "." has none.
+let depth(p: String!): Int! {
+  if (p == ".") { 0 } else { p.split("/").length }
+}
+
+# Static reading of playwright.config: only literal values are honoured, and
+# nothing here runs a container or Node. Offsets are byte offsets, so the
+# source is made ASCII first.
+
+# Playwright's default testMatch.
+let defaultTestMatch = "**/*.@(spec|test).?(c|m)[jt]s?(x)"
+
+# A JS string literal: single, double, or backtick without interpolation.
+let stringLiteral = `'(?:[^'\\\n]|\\.)*'|"(?:[^"\\\n]|\\.)*"|` + "`" + `(?:[^` + "`" + `$\\]|\\[\s\S])*` + "`"
+
+# A JS regex literal body and flags.
+let regexLiteral = `/(?:[^/\\\n\[*]|\\.|\[(?:[^\]\\\n]|\\.)*\])(?:[^/\\\n\[]|\\.|\[(?:[^\]\\\n]|\\.)*\])*/[a-z]*`
+
+# One literal pattern: a string (a glob) or a regex literal.
+let patternLiteral = stringLiteral + "|" + regexLiteral
+
+# Comments, strings and regex literals: everything whose brackets and commas
+# are not code. Template strings are masked whole, ${} parts included. A
+# regex literal is recognized only after a character that can precede an
+# expression, captured so masking keeps it.
+let tokenPattern = `//[^\n]*|/\*[\s\S]*?\*/|'(?:[^'\\\n]|\\.)*'|"(?:[^"\\\n]|\\.)*"|` + "`" + `(?:[^` + "`" + `\\]|\\[\s\S])*` + "`" + `|([:\[,(=!&|?]\s*)` + regexLiteral
+
+# A run of n filler characters.
+let fill(n: Int!, char: String!): String! {
+  "".padRight(n).replace(" ", char)
+}
+
+# Byte length of an ASCII string.
+let size(s: String!): Int! { s.split("").length }
+
+# The bytes of s in [start, end); s must be ASCII.
+let slice(s: String!, start: Int!, end: Int!): String! {
+  s.truncate(end).trimPrefix(s.truncate(start))
+}
+
+# Replace comments, strings and regex literals with filler of the same length,
+# so offsets line up with the source while their brackets and commas vanish.
+let mask(source: String!): String! {
+  source.rewriteMatches(Regexp(tokenPattern)) { m =>
+    let lead = m.captures[0] ?? ""
+    # Comments read as whitespace; literals as an opaque word.
+    let char = if (m.string.hasPrefix("/")) { " " } else { "_" }
+    lead + fill(m.end - m.start - size(lead), char)
   }
 }
 
+# Replace every innermost bracketed group with filler of the same length,
+# keeping a marker for its opening bracket: "~" for {, "^" for [, "%" for (.
+let flattenOnce(masked: String!): String! {
+  masked.rewriteMatches(`[{\[(][^{}\[\]()]*[}\])]`) { m =>
+    let open = if (m.string.hasPrefix("{")) { "~" } else if (m.string.hasPrefix("[")) { "^" } else { "%" }
+    open + fill(m.end - m.start - 1, "_")
+  }
+}
+
+# The group opening at offset start, once everything nested in it has been
+# flattened: its own top level is then plain text. Null when there is none.
+let groupAt(masked: String!, start: Int!): String {
+  let hits = masked.matchAll(`[{\[(][^{}\[\]()]*[}\])]`).filter { m => m.start == start }
+  let hit = hits[0]
+  if (hit != null) {
+    return hit.string
+  }
+  let next = flattenOnce(masked)
+  if (next == masked) {
+    return null
+  }
+  groupAt(next, start)
+}
+
+# A string literal's value, or null when text is anything else.
+let stringValue(text: String!): String {
+  let m = text.trimSpace.match(Regexp(`^(?:'((?:[^'\\\n]|\\.)*)'|"((?:[^"\\\n]|\\.)*)"|` + "`" + `([^` + "`" + `$\\]*)` + "`" + `)$`))
+  if (m == null) {
+    return null
+  }
+  m.captures.join("").replaceMatches(`\\(.)`, "$1")
+}
+
+# A testDir value: a string literal (relative to the config directory), or
+# path.join/path.resolve of __dirname and string literals, returned as
+# "__dirname/<path>". Null otherwise.
+let dirValue(text: String!): String {
+  let plain = stringValue(text)
+  if (plain != null) {
+    return plain
+  }
+  let call = text.trimSpace.match(
+    Regexp(`^(?:path\.)?(?:join|resolve)\(\s*(?:__dirname|import\.meta\.dirname)((?:\s*,\s*(?:` + stringLiteral + `))+)\s*,?\s*\)$`),
+  )
+  if (call == null) {
+    return null
+  }
+  let parts = (call.captures[0] ?? "").matchAll(Regexp(stringLiteral)).map { p => stringValue(p.string) ?? "" }
+  "__dirname/" + parts.join("/")
+}
+
+# A literal pattern as a regexp over absolute paths, or null when it cannot
+# be translated: a string is a glob, /.../flags a regex literal.
+let patternRegex(text: String!): String {
+  let glob = stringValue(text)
+  if (glob != null) {
+    return globRegex(glob)
+  }
+  let re = text.trimSpace.match(`^/([\s\S]*)/([a-z]*)$`)
+  if (re == null) {
+    return null
+  }
+  let flags = re.captures[1] ?? ""
+  let prefix = ["i", "m", "s"].filter { f => flags.contains(f) }.join("")
+  let pattern = (if (prefix == "") { "" } else { "(?" + prefix + ")" }) + (re.captures[0] ?? "")
+  # RE2 has no lookaround or backreferences; such a regex falls back.
+  let ok = { Regexp(pattern); true } rescue {
+    err: Error => false
+  }
+  if (ok) { pattern } else { null }
+}
+
+# A testMatch/testIgnore value as regexps: a literal pattern or an array of
+# them. Null when the value is anything else, or any element can't be read.
+let patternsValue(text: String!): [String!] {
+  let trimmed = text.trimSpace
+  let items = if (trimmed.hasPrefix("[") and trimmed.hasSuffix("]")) {
+    let inner = trimmed.trimPrefix("[").trimSuffix("]")
+    let element = Regexp(`\s*(?:` + patternLiteral + `)\s*(?:,|$)`)
+    if (inner.replaceMatches(element, with: "").trimSpace != "") {
+      return null
+    }
+    inner.matchAll(element).map { m => m.string.trimSpace.trimSuffix(",") }
+  } else {
+    [trimmed]
+  }
+  let regexes = items.map { item => patternRegex(item) ?? "" }
+  if (regexes.contains("")) { null } else { regexes }
+}
+
+# A glob in minimatch syntax (nocase, dot) as a regexp over absolute paths,
+# matched like Playwright does: a pattern not starting with **/ gets one.
+# Null for syntax this does not translate (!(...)).
+let globRegex(glob: String!): String {
+  let tokens = glob.matchAll(
+    `\*\*/|\*\*|[@?+*!]\(|[{}()|,*?/]|\[(?:\\.|[^\]\\])+\]|\\.|[^*?\[\]{}()|,@+!\\/]+|[\s\S]`,
+  ).map { m => m.string }
+  let empty: [String!]! = []
+  let state = tokens.reduce({{out: "", stack: empty, bad: false}}) { st, tok =>
+    let top = st.stack.takeLast(1)[0] ?? ""
+    let inBrace = top == "{"
+    let inExt = top != "" and top != "{"
+    if (tok == "**/") {
+      {{out: st.out + "(?:.*/)?", stack: st.stack, bad: st.bad}}
+    } else if (tok == "**") {
+      {{out: st.out + ".*", stack: st.stack, bad: st.bad}}
+    } else if (tok == "*") {
+      {{out: st.out + "[^/]*", stack: st.stack, bad: st.bad}}
+    } else if (tok == "?") {
+      {{out: st.out + "[^/]", stack: st.stack, bad: st.bad}}
+    } else if (tok == "!(") {
+      {{out: st.out, stack: st.stack, bad: true}}
+    } else if (tok == "@(" or tok == "?(" or tok == "+(" or tok == "*(") {
+      {{
+        out: st.out + "(?:",
+        stack: st.stack + [tok.trimSuffix("(")],
+        bad: st.bad
+      }}
+    } else if (tok == "{") {
+      {{out: st.out + "(?:", stack: st.stack + ["{"], bad: st.bad}}
+    } else if (tok == "}" and inBrace) {
+      {{out: st.out + ")", stack: st.stack.dropLast(1), bad: st.bad}}
+    } else if (tok == "," and inBrace) {
+      {{out: st.out + "|", stack: st.stack, bad: st.bad}}
+    } else if (tok == "|" and inExt) {
+      {{out: st.out + "|", stack: st.stack, bad: st.bad}}
+    } else if (tok == ")" and inExt) {
+      let suffix = if (top == "@") { "" } else { top }
+      {{out: st.out + ")" + suffix, stack: st.stack.dropLast(1), bad: st.bad}}
+    } else if (tok.hasPrefix("[") and tok.hasSuffix("]") and size(tok) > 2) {
+      let body = tok.trimPrefix("[").trimSuffix("]")
+      let negated = if (body.hasPrefix("!")) { "^" + body.trimPrefix("!") } else { body }
+      {{out: st.out + "[" + negated + "]", stack: st.stack, bad: st.bad}}
+    } else if (tok.hasPrefix("\\") and size(tok) == 2) {
+      {{
+        out: st.out + Regexp.escape(tok.trimPrefix("\\")),
+        stack: st.stack,
+        bad: st.bad
+      }}
+    } else {
+      {{out: st.out + Regexp.escape(tok), stack: st.stack, bad: st.bad}}
+    }
+  }
+  if (state.bad or state.stack.length > 0) {
+    return null
+  }
+  let body = if (glob.hasPrefix("**/")) { state.out } else { "(?:.*/)?" + state.out }
+  let pattern = "(?i)^" + body + "$"
+  let ok = { Regexp(pattern); true } rescue {
+    err: Error => false
+  }
+  if (ok) { pattern } else { null }
+}
+
+# What a config says about one field: "absent", "literal" (with values), or
+# "dynamic" (set to something this can't read).
+let field(state: String!, values: [String!]!): {{state: String!, values: [String!]!}}! {
+  {{state, values}}
+}
+
+# The source with non-ASCII characters replaced, so byte offsets and
+# character offsets agree.
+let ascii(source: String!): String! {
+  source.replaceMatches(`[^\x00-\x7F]`, with: "?")
+}
+
+# The source with comments blanked and everything else intact.
+let uncomment(source: String!): String! {
+  source.rewriteMatches(Regexp(tokenPattern)) { m =>
+    if (m.string.hasPrefix("/")) { fill(m.end - m.start, " ") } else { m.string }
+  }
+}
+
+# testDir, testMatch and testIgnore of the object at start. testDir values
+# are relative to the config directory, or "@<workspace path>" when written
+# with __dirname (which is the file's own directory, fileDir).
+let fieldsAt(source: String!, masked: String!, start: Int!, fileDir: String!): {{testDir: {{state: String!, values: [String!]!}}!, testMatch: {{state: String!, values: [String!]!}}!, testIgnore: {{state: String!, values: [String!]!}}!}}! {
+  let body = groupAt(masked, start) ?? ""
+  let length = size(body)
+  # Keys at this object's top level; nested objects are flattened, so their
+  # keys don't match.
+  let props = body.matchAll(`[{,]\s*(\w+)\s*:`)
+  let read(name: String!, parse: String!): {{state: String!, values: [String!]!}}! {
+    # A key without a value (shorthand) is a variable.
+    if (body.containsMatch(Regexp(`[{,]\s*` + name + `\s*[,}]`))) {
+      return field("dynamic", [])
+    }
+    let hit = props.filter { m => (m.captures[0] ?? "") == name }.takeLast(1)[0]
+    if (hit == null) {
+      return field("absent", [])
+    }
+    let value = slice(body, hit.end, length).match(`^[^,}]*`)
+    let text = slice(source, start + hit.end, start + hit.end + (if (value == null) { 0 } else { value.end }))
+    let values = if (parse == "dir") {
+      let dir = dirValue(text)
+      if (dir == null) {
+        null
+      } else if (dir.hasPrefix("__dirname/")) {
+        ["@" + rootPath(fileDir, dir.trimPrefix("__dirname/"))]
+      } else {
+        [dir]
+      }
+    } else {
+      patternsValue(text)
+    }
+    if (values == null) { field("dynamic", []) } else { field("literal", values) }
+  }
+  {{
+    testDir: read("testDir", "dir"),
+    testMatch: read("testMatch", "patterns"),
+    testIgnore: read("testIgnore", "patterns")
+  }}
+}
+
+# Everything read from one config object: its fields, its Playwright
+# projects ("absent", "literal" with entries, or "dynamic"), and the first
+# identifier spread into it ("" for none).
+let objectSettings(
+  source: String!,
+  masked: String!,
+  start: Int!,
+  fileDir: String!,
+): {{testDir: {{state: String!, values: [String!]!}}!, testMatch: {{state: String!, values: [String!]!}}!, testIgnore: {{state: String!, values: [String!]!}}!, projectsState: String!, projects: [{{testDir: {{state: String!, values: [String!]!}}!, testMatch: {{state: String!, values: [String!]!}}!, testIgnore: {{state: String!, values: [String!]!}}!}}!]!, spread: String!}}! {
+  let own = fieldsAt(source, masked, start, fileDir)
+  let body = groupAt(masked, start) ?? ""
+  let length = size(body)
+  let hit = body.matchAll(`[{,]\s*projects\s*:\s*`).takeLast(1)[0]
+  let at = if (hit == null) { -1 } else { start + hit.end }
+  let isArray = at >= 0 and slice(masked, at, at + 1) == "["
+  let entries = if (isArray) {
+    let array = groupAt(masked, at) ?? ""
+    array
+      .matchAll(`~_*`)
+      .map { m => at + m.start }
+      .filter { entry => slice(masked, entry, entry + 1) == "{" }
+      .map { entry => fieldsAt(source, masked, entry, fileDir) }
+  } else {
+    []
+  }
+  let projectsState = if (hit == null and body.containsMatch(`[{,]\s*projects\s*[,}]`) == false) {
+    "absent"
+  } else if (isArray and entries.length > 0) {
+    "literal"
+  } else if (isArray) {
+    "absent"
+  } else {
+    "dynamic"
+  }
+  let spread = body.match(`[{,]\s*\.\.\.\s*(\w+)\s*[,}]`)
+  {{
+    testDir: own.testDir,
+    testMatch: own.testMatch,
+    testIgnore: own.testIgnore,
+    projectsState,
+    projects: entries,
+    spread: if (spread == null) { "" } else { spread.captures[0] ?? "" }
+  }}
+}
+
+# Settings of an object that has nothing literal in it.
+let noSettings: {{testDir: {{state: String!, values: [String!]!}}!, testMatch: {{state: String!, values: [String!]!}}!, testIgnore: {{state: String!, values: [String!]!}}!, projectsState: String!, projects: [{{testDir: {{state: String!, values: [String!]!}}!, testMatch: {{state: String!, values: [String!]!}}!, testIgnore: {{state: String!, values: [String!]!}}!}}!]!, spread: String!}}! =
+  objectSettings("{}", "{}", 0, ".")
+
+# over's settings on top of base's, as a spread followed by local keys does.
+let mergeSettings(
+  base: {{testDir: {{state: String!, values: [String!]!}}!, testMatch: {{state: String!, values: [String!]!}}!, testIgnore: {{state: String!, values: [String!]!}}!, projectsState: String!, projects: [{{testDir: {{state: String!, values: [String!]!}}!, testMatch: {{state: String!, values: [String!]!}}!, testIgnore: {{state: String!, values: [String!]!}}!}}!]!, spread: String!}}!,
+
+  over: {{testDir: {{state: String!, values: [String!]!}}!, testMatch: {{state: String!, values: [String!]!}}!, testIgnore: {{state: String!, values: [String!]!}}!, projectsState: String!, projects: [{{testDir: {{state: String!, values: [String!]!}}!, testMatch: {{state: String!, values: [String!]!}}!, testIgnore: {{state: String!, values: [String!]!}}!}}!]!, spread: String!}}!,
+): {{testDir: {{state: String!, values: [String!]!}}!, testMatch: {{state: String!, values: [String!]!}}!, testIgnore: {{state: String!, values: [String!]!}}!, projectsState: String!, projects: [{{testDir: {{state: String!, values: [String!]!}}!, testMatch: {{state: String!, values: [String!]!}}!, testIgnore: {{state: String!, values: [String!]!}}!}}!]!, spread: String!}}! {
+  let keep = over.projectsState == "absent"
+  {{
+    testDir: if (over.testDir.state == "absent") { base.testDir } else { over.testDir },
+    testMatch: if (over.testMatch.state == "absent") { base.testMatch } else { over.testMatch },
+    testIgnore: if (over.testIgnore.state == "absent") { base.testIgnore } else { over.testIgnore },
+    projectsState: if (keep) { base.projectsState } else { over.projectsState },
+    projects: if (keep) { base.projects } else { over.projects },
+    spread: ""
+  }}
+}
+
+# Where a file's config object is: "object" at an offset in the file,
+# "import" of an export (name) from a relative module (from), or "none".
+let target(kind: String!, at: Int!, name: String!, from: String!): {{kind: String!, at: Int!, name: String!, from: String!}}! {
+  {{kind, at, name, from}}
+}
+
+# The module an identifier is imported from, as a target, or kind "none".
+let importOf(clean: String!, ident: String!): {{kind: String!, at: Int!, name: String!, from: String!}}! {
+  let imports = clean.matchAll(
+    `import\s+(?:type\s+)?(?:(\w+)\s*,?\s*)?(?:\{([^}]*)\})?\s*from\s*['"]([^'"]+)['"]`,
+  )
+  let found = imports.reduce(target("none", 0, "", "")) { acc, m =>
+    let from = m.captures[2] ?? ""
+    if (acc.kind != "none") {
+      acc
+    } else if ((m.captures[0] ?? "") == ident) {
+      target("import", 0, "default", from)
+    } else {
+      let named = (m.captures[1] ?? "").split(",").map { part => part.trimSpace }.filter { part =>
+        part == ident or part.hasSuffix(" " + ident)
+      }[0]
+      if (named == null) {
+        acc
+      } else {
+        target("import", 0, named.split(" ")[0] ?? ident, from)
+      }
+    }
+  }
+  found
+}
+
+# Where the object an identifier names is: a const in this file, or an import.
+let identTarget(masked: String!, clean: String!, ident: String!): {{kind: String!, at: Int!, name: String!, from: String!}}! {
+  let local = masked.match(
+    Regexp(`(?:const|let|var)\s+` + ident + `\s*(?::[^=;]*)?=\s*(?:defineConfig\s*\(\s*)?\{`),
+  )
+  if (local != null) {
+    return target("object", local.end - 1, "", "")
+  }
+  importOf(clean, ident)
+}
+
+# Where a config file's default export is.
+let configTarget(source: String!): {{kind: String!, at: Int!, name: String!, from: String!}}! {
+  let masked = mask(source)
+  let clean = uncomment(source)
+  let direct = masked.match(`(?:defineConfig\s*\(\s*|export\s+default\s+|module\.exports\s*=\s*)\{`)
+  if (direct != null) {
+    return target("object", direct.end - 1, "", "")
+  }
+  let reexport = clean.match(`export\s*\{\s*(\w+)\s+as\s+default\s*\}\s*from\s*['"]([^'"]+)['"]`)
+  if (reexport != null) {
+    return target("import", 0, reexport.captures[0] ?? "", reexport.captures[1] ?? "")
+  }
+  let passthrough = clean.match(`export\s*\{\s*default\s*\}\s*from\s*['"]([^'"]+)['"]`)
+  if (passthrough != null) {
+    return target("import", 0, "default", passthrough.captures[0] ?? "")
+  }
+  let named = masked.match(`(?:export\s+default\s+|module\.exports\s*=\s*)(?:defineConfig\s*\(\s*)?(\w+)`)
+  if (named != null) {
+    return identTarget(masked, clean, named.captures[0] ?? "")
+  }
+  target("none", 0, "", "")
+}
+
+# Where a module's export of name is, without following further imports.
+let exportTarget(source: String!, name: String!): {{kind: String!, at: Int!, name: String!, from: String!}}! {
+  if (name == "default") {
+    let found = configTarget(source)
+    return if (found.kind == "object") { found } else { target("none", 0, "", "") }
+  }
+  let local = identTarget(mask(source), uncomment(source), name)
+  if (local.kind == "object") { local } else { target("none", 0, "", "") }
+}
+
+# The Playwright projects settings describe, as (testDir as a workspace path,
+# testMatch regexps, testIgnore regexps). Absent values inherit from the
+# config's top level, then Playwright's defaults; dynamic ones take the
+# defaults.
+let specsOf(
+  settings: {{testDir: {{state: String!, values: [String!]!}}!, testMatch: {{state: String!, values: [String!]!}}!, testIgnore: {{state: String!, values: [String!]!}}!, projectsState: String!, projects: [{{testDir: {{state: String!, values: [String!]!}}!, testMatch: {{state: String!, values: [String!]!}}!, testIgnore: {{state: String!, values: [String!]!}}!}}!]!, spread: String!}}!,
+
+  configDir: String!,
+): [{{dir: String!, match: [String!]!, ignore: [String!]!}}!]! {
+  let defaultMatch: [String!]! = [globRegex(defaultTestMatch) ?? ""]
+  let empty: [String!]! = []
+  let dirOfValue(value: String!): String! {
+    if (value.hasPrefix("@")) {
+      value.trimPrefix("@")
+    } else if (value.hasPrefix("/")) {
+      configDir
+    } else {
+      rootPath(configDir, value)
+    }
+  }
+  let resolve(
+    value: {{state: String!, values: [String!]!}}!,
+    inherited: [String!]!,
+    fallback: [String!]!,
+  ): [String!]! {
+    if (value.state == "literal") { value.values } else if (value.state == "dynamic") { fallback } else { inherited }
+  }
+  let dir = dirOfValue(resolve(settings.testDir, ["."], ["."])[0] ?? ".")
+  let match = resolve(settings.testMatch, defaultMatch, defaultMatch)
+  let ignore = resolve(settings.testIgnore, empty, empty)
+  if (settings.projectsState != "literal") {
+    return [{{dir, match, ignore}}]
+  }
+  settings.projects.map { own =>
+    {{
+      dir: if (own.testDir.state == "literal") {
+        dirOfValue(own.testDir.values[0] ?? ".")
+      } else if (own.testDir.state == "dynamic") {
+        configDir
+      } else {
+        dir
+      },
+
+      match: resolve(own.testMatch, match, defaultMatch),
+      ignore: resolve(own.testIgnore, ignore, empty)
+    }}
+  }
+}
+
+# Every relative module path an import specifier could name, most likely
+# first (TypeScript sources import "./x.js" for "./x.ts").
+let moduleCandidates(fromDir: String!, spec: String!): [String!]! {
+  if (spec.hasPrefix("./") == false and spec.hasPrefix("../") == false) {
+    return []
+  }
+  let base = rootPath(fromDir, spec)
+  let known = base.containsMatch(`\.(?:[cm]?[jt]s)$`)
+  if (known) {
+    [base, base.replaceMatches(`\.js$`, with: ".ts"), base.replaceMatches(`\.mjs$`, with: ".mts")].uniq
+  } else {
+    [base + ".ts", base + ".js", base + ".mjs", base + ".mts", base + ".cjs", base + "/index.ts", base + "/index.js"]
+  }
+}
+
+# relPath is to, relative to from; both are root-relative directories/files.
+let relPath(from: String!, to: String!): String! {
+  if (from == ".") {
+    return to
+  }
+  if (to.hasPrefix(from + "/")) {
+    return to.trimPrefix(from + "/")
+  }
+  let a = from.split("/")
+  let b = if (to == ".") { [] :: [String!]! } else { to.split("/") }
+  let common = a.reduce({{n: 0, same: true}}) { st, seg =>
+    if (st.same and (b[st.n] ?? "") == seg) {
+      {{n: st.n + 1, same: true}}
+    } else {
+      {{n: st.n, same: false}}
+    }
+  }
+  let up = range(a.length - common.n).map { i => ".." }
+  (up + b.dropFirst(common.n)).join("/")
+}
+
+# under reports whether a root-relative path is dir or inside it.
+let under(dir: String!, p: String!): Boolean! {
+  dir == "." or p == dir or p.hasPrefix(dir + "/")
+}
+
+# splitInto divides items into at most count contiguous groups whose sizes
+# differ by at most one, keeping their order.
+let splitInto(items: [String!]!, count: Int!): [[String!]!]! {
+  let n = items.length
+  let groups = if (count < n) { count } else { n }
+  if (groups <= 0) {
+    return [] :: [[String!]!]!
+  }
+  let size = n / groups
+  let extra = n % groups
+  range(groups).map { k =>
+    let i = k - 1
+    let start = i * size + (if (i < extra) { i } else { extra })
+    let length = size + (if (i < extra) { 1 } else { 0 })
+    items.dropFirst(start).takeFirst(length)
+  }
+}
+
+"""
+Run Playwright browser tests against the projects in a workspace.
+"""
 type Playwright {
   """
-  The workspace root directory.
-  """
-  source: Directory!
-
-  """
-  Root-absolute path of the Playwright project directory (contains
-  playwright.config.*) within the workspace — "/" is the workspace root.
-  Discovered from the client's working directory or chosen via sourcePath.
-  """
-  path: String!
-
-  """
-  Root-absolute path of the directory holding the nearest package.json at or
-  above the project — where dependencies are installed. Null when the
-  workspace has none: the install is skipped and npx fetches Playwright on
-  demand.
-  """
-  installDir: String
-
-  """
-  Base container override. When null, the image is derived from the project's
-  @playwright/test version.
+  Base container override. When null, the image is derived from each
+  project's @playwright/test version.
   """
   baseCtr: Container
 
@@ -68,22 +597,53 @@ type Playwright {
   """
   service: Service
 
+  """
+  Hostname the service is bound as inside the test container.
+  """
   serviceHostname: String!
+
+  """
+  Playwright image to run tests in. Empty derives it per project.
+  """
   baseImageAddress: String!
+
+  """
+  Package manager used to install dependencies; empty detects it per project.
+  """
   packageManager: String!
+
+  """
+  Extra arguments for the install command.
+  """
+  installFlags: [String!]!
+
+  """
+  Environment variables for the test containers, as KEY=VALUE.
+  """
+  environment: [String!]!
+
+  """
+  Whether localhost:<port> is proxied to the bound service.
+  """
   localhostProxy: Boolean!
+
+  """
+  Extra arguments passed to every `playwright test` invocation.
+  """
   args: [String!]!
+
+  """
+  Number of parallel shards each project's tests run in.
+  """
   shards: Int!
 
+  """
+  Shell commands run in the project directory after the full source is in
+  place and before the tests.
+  """
+  setup: [String!]!
+
   new(
-    ws: Workspace!,
-    """
-    Path of the Playwright project, relative to the client's working directory
-    (absolute paths resolve from the workspace root). Empty (default) discovers
-    the directory containing playwright.config.* — required when the workspace
-    holds more than one Playwright project.
-    """
-    sourcePath: String! = "",
     """
     Base container to use instead of the derived Playwright image
     (wireable: settings.baseCtr = "<module>:<function>" for any Container-returning function).
@@ -103,14 +663,25 @@ type Playwright {
     serviceHostname: String! = "frontend",
     """
     Playwright image to run tests in. Empty (default) derives
-    mcr.microsoft.com/playwright:v<version>-noble from the project's
+    mcr.microsoft.com/playwright:v<version>-noble from each project's
     @playwright/test dependency. The image's browsers must match that version.
     """
     baseImageAddress: String! = "",
     """
-    Package manager used to install the project's dependencies (npm, yarn, pnpm, bun).
+    Package manager used to install dependencies (npm, yarn, pnpm, bun).
+    Empty (default) detects it from the install root's package.json
+    "packageManager" field, else its lockfile, else npm.
     """
-    packageManager: String! = "npm",
+    packageManager: String! = "",
+    """
+    Extra arguments appended to the install command (e.g. ["--ignore-scripts"]).
+    """
+    installFlags: [String!]! = [],
+    """
+    Environment variables set in the test containers, as KEY=VALUE
+    (e.g. ["DEBUG=pw:api"]).
+    """
+    environment: [String!]! = [],
     """
     Proxy localhost:<port> to the bound service via socat, and set
     PLAYWRIGHT_LOCALHOST_BASE_URL. For tests that need a secure context
@@ -124,126 +695,333 @@ type Playwright {
     """
     args: [String!]! = [],
     """
-    Default number of parallel test shards for `test` — set this to shard
-    the `playwright:test` check.
+    Number of parallel test shards each project's tests run in.
     """
     shards: Int! = 1,
+    """
+    Shell commands run in the project directory after dependencies are
+    installed and the full source is in place, before the tests (e.g.
+    ["pnpm --filter @my/lib build"] to build workspace packages the tests
+    import).
+    """
+    setup: [String!]! = [],
   ) {
-    if (sourcePath != "") {
-      self.path = workspacePath(ws.cwd, sourcePath)
-    } else {
-      # Discovery searches at or below the client's working directory.
-      let matches = ws.directory(".", include: ["**/playwright.config.*"]).glob("**/playwright.config.*")
-      # Ignore configs inside hidden directories (editor state, stale worktrees).
-      let visible = matches.filter { m => !m.hasPrefix(".") and !m.contains("/.") }
-      if (visible.isEmpty) {
-        raise "no playwright.config.* found in workspace; set sourcePath to your Playwright project"
-      }
-      if (visible.length > 1) {
-        raise `multiple Playwright projects found (${visible.join(", ")}); set sourcePath to choose one`
-      }
-      let first = visible[0]
-      if (first == null) {
-        raise "no playwright.config.* found in workspace"
-      } else {
-        # parent dir of the config: trim the filename (last path segment)
-        let filename = first.split("/").reduce("") { acc, part => part }
-        let projectDir = first.trimSuffix(filename).trimSuffix("/")
-        self.path = workspacePath(ws.cwd, projectDir)
-      }
-    }
-    self.source = ws.directory("/", exclude: ["**/node_modules"])
-    self.installDir = installDirFor(ws, self.path)
     self.baseCtr = baseCtr
     self.service = service
     self.serviceHostname = serviceHostname
     self.baseImageAddress = baseImageAddress
     self.packageManager = packageManager
+    self.installFlags = installFlags
+    self.environment = environment
     self.localhostProxy = localhostProxy
     self.args = args
     self.shards = shards
+    self.setup = setup
     self
   }
 
-  # The directory whose package.json / lockfile declare the Playwright
-  # dependency — the install root when one exists, else the project.
-  let pkgRoot: Directory! {
-    let dir = installDir
-    if (dir == null) { source.directory(path) } else { source.directory(dir) }
-  }
-
-  # The @playwright/test version actually installed per package-lock.json,
-  # or null when there is no lockfile entry.
-  let lockedVersion: String {
-    let lock = if (pkgRoot.exists("package-lock.json")) {
-      pkgRoot.file("package-lock.json").contents
-    } else {
-      ""
-    }
-    let entry = lock.split(`"node_modules/@playwright/test"`)[1]
-    if (entry == null) {
-      null
-    } else {
-      let v = entry.split(`"version": "`)[1]
-      if (v == null) {
-        null
-      } else {
-        v.split(`"`)[0]
-      }
-    }
-  }
-
-  # Image derived from the version range declared in package.json,
-  # falling back to the module's pinned default.
-  let declaredImage: String! {
-    let pkg = if (pkgRoot.exists("package.json")) {
-      pkgRoot.file("package.json").contents
-    } else {
-      ""
-    }
-    # Extract the version from `"@playwright/test": "<range>"`.
-    let after = pkg.split(`"@playwright/test"`)[1]
-    if (after == null) {
-      fallbackImage
-    } else {
-      let ver = after.split(`"`)[1]
-      if (ver == null) {
-        fallbackImage
-      } else {
-        let clean = ver.trimLeft("^~>=< ")
-        if (clean == "") {
-          fallbackImage
-        } else {
-          `mcr.microsoft.com/playwright:v${clean}-noble`
-        }
-      }
-    }
+  """
+  Playwright projects at or below the working directory, keyed by config directory.
+  """
+  projects(ws: Workspace!): PlaywrightProjects! {
+    # One findRoots walk answers this, so listing never runs a container. It
+    # returns every config directory at or below the cwd, plus the nearest
+    # enclosing one when the cwd is inside a project; the excludes prune
+    # node_modules and hidden directories from the walk itself.
+    let found = ws
+      .findRoots(markers: configNames, exclude: ["**/node_modules", "**/.*"])
+      .map { p => rootPath(ws.cwd, p) }
+      .uniq
+    PlaywrightProjects(paths: sorted(found), tool: self)
   }
 
   """
-  The resolved Playwright image address: the explicit baseImageAddress when
-  set; else derived from the @playwright/test version installed per the
-  project's lockfile; else from the version declared in package.json; else
-  the module's pinned fallback.
+  The Playwright project containing a workspace path.
   """
-  imageAddress: String! {
-    if (baseImageAddress != "") {
-      baseImageAddress
+  project(
+    ws: Workspace!,
+    """
+    A directory at or below the project's playwright.config, relative to the
+    working directory (absolute paths resolve from the workspace root).
+    """
+    path: String!,
+  ): PlaywrightProject! {
+    let from = wsPath(rootPath(ws.cwd, path))
+    # The nearest config at or above the path wins, whatever its extension.
+    let empty: [String!]! = []
+    let dirs = configNames.reduce(empty) { acc, name =>
+      let found = ws.findUp(name, from: from)
+      if (found == null) { acc } else { acc + [dirOf(found)] }
+    }
+    let nearest = dirs.reduce("") { best, dir =>
+      if (best == "" or depth(dir) > depth(best)) { dir } else { best }
+    }
+    if (nearest == "") {
+      raise "no playwright.config.* found at or above " + path
+    }
+    projectAt(nearest)
+  }
+
+  let projectAt(path: String!): PlaywrightProject! {
+    PlaywrightProject(path: path, tool: self)
+  }
+}
+
+"""
+Playwright projects in a workspace, keyed by config directory.
+"""
+type PlaywrightProjects @collection {
+  """
+  Directories holding a playwright.config, relative to the workspace root.
+  """
+  paths: [String!]! @keys
+
+  """
+  Settings every project runs with.
+  """
+  let tool: Playwright!
+
+  """
+  The Playwright project whose config is in path.
+  """
+  project(path: String!): PlaywrightProject! @get {
+    tool.projectAt(path)
+  }
+
+  """
+  Run Playwright tests in the selected projects.
+  """
+  test(ws: Workspace!): Void {
+    # A selection over a list evaluates its elements concurrently, so every
+    # project (and each project's shards) runs in parallel.
+    let failures = paths.map { p => project(p) }.{{path, failure: testFailure(ws)}}
+      .filter { result => result.failure != null }
+    if (failures.length > 0) {
+      raise "Playwright failed:\n" + failures.map { result =>
+        "- " + result.path + ": " + (result.failure ?? "")
+      }.join("\n")
+    }
+    null
+  }
+}
+
+"""
+A Playwright project: a directory holding a playwright.config.
+"""
+type PlaywrightProject {
+  """
+  Directory holding the playwright.config, relative to the workspace root.
+  """
+  path: String!
+
+  """
+  Settings this project runs with.
+  """
+  let tool: Playwright!
+
+  # The parent of a workspace path, or null at the root.
+  let parentOf(dir: String!): String {
+    if (dir == ".") { null } else { dirOf("/" + dir) }
+  }
+
+  # The directory of the nearest file named name at or above from, or null.
+  let nearest(ws: Workspace!, name: String!, from: String!): String {
+    let found = ws.findUp(name, from: wsPath(from))
+    if (found == null) { null } else { dirOf(found) }
+  }
+
+  # A workspace file's text, or "" when it can't be read.
+  let text(ws: Workspace!, file: String!): String! {
+    { ws.file(wsPath(file)).contents } rescue {
+      err: Error => ""
+    }
+  }
+
+  # The nearest directory at or above from whose package.json matches
+  # pattern, or null.
+  let packageJsonMatching(ws: Workspace!, from: String!, pattern: String!): String {
+    let dir = nearest(ws, "package.json", from)
+    if (dir == null) {
+      return null
+    }
+    let file = if (dir == ".") { "package.json" } else { dir + "/package.json" }
+    if (text(ws, file).containsMatch(Regexp(pattern))) {
+      return dir
+    }
+    let up = parentOf(dir)
+    if (up == null) { null } else { packageJsonMatching(ws, up, pattern) }
+  }
+
+  # The deeper of two optional workspace paths on one ancestor chain.
+  let deeper(a: String, b: String): String {
+    if (a == null) { b } else if (b == null) { a } else if (depth(a) >= depth(b)) { a } else { b }
+  }
+
+  """
+  Where dependencies are installed, relative to the workspace root: the
+  nearest workspace root at or above the project (pnpm-workspace.yaml, or a
+  package.json with "workspaces"), else the nearest lockfile, else the
+  nearest package.json. Null when there is none: the install is skipped and
+  npx fetches Playwright on demand.
+  """
+  installDir(ws: Workspace!): String {
+    let workspaceRoot = deeper(
+      nearest(ws, "pnpm-workspace.yaml", path),
+      packageJsonMatching(ws, path, `"workspaces"\s*:`),
+    )
+    if (workspaceRoot != null) {
+      return workspaceRoot
+    }
+    let locks = lockfiles.map { name => nearest(ws, name, path) ?? "" }.filter { dir => dir != "" }
+    let lockDir = locks.reduce(locks[0] ?? "") { acc, dir => if (depth(dir) > depth(acc)) { dir } else { acc } }
+    if (lockDir != "") { lockDir } else { nearest(ws, "package.json", path) }
+  }
+
+  # The lockfiles an install root may hold, most specific first.
+  let lockfiles: [String!]! {
+    ["pnpm-lock.yaml", "yarn.lock", "bun.lock", "bun.lockb", "package-lock.json", "npm-shrinkwrap.json"]
+  }
+
+  # Whether a file exists directly in a workspace directory.
+  let hasFile(ws: Workspace!, dir: String!, name: String!): Boolean! {
+    nearest(ws, name, dir) == dir
+  }
+
+  """
+  The package manager dependencies are installed with: the packageManager
+  setting, else the install root's package.json "packageManager" field, else
+  its lockfile (npm when there is none).
+  """
+  packageManager(ws: Workspace!): String! {
+    if (tool.packageManager != "") {
+      return tool.packageManager
+    }
+    let root = installDir(ws)
+    if (root == null) {
+      return "npm"
+    }
+    let declared = text(ws, if (root == ".") { "package.json" } else { root + "/package.json" })
+      .match(`"packageManager"\s*:\s*"(npm|pnpm|yarn|bun)@`)
+    if (declared != null) {
+      return declared.captures[0] ?? "npm"
+    }
+    if (hasFile(ws, root, "pnpm-lock.yaml") or hasFile(ws, root, "pnpm-workspace.yaml")) {
+      "pnpm"
+    } else if (hasFile(ws, root, "yarn.lock")) {
+      "yarn"
+    } else if (hasFile(ws, root, "bun.lock") or hasFile(ws, root, "bun.lockb")) {
+      "bun"
     } else {
-      let locked = lockedVersion
-      if (locked == null) {
-        declaredImage
-      } else if (locked == "") {
-        declaredImage
+      "npm"
+    }
+  }
+
+  # The @playwright/test version the install root's lockfile resolves, or
+  # null. With several versions in a pnpm lockfile, the declaring package's
+  # importer entry wins.
+  let lockedVersion(ws: Workspace!, root: String!, declaring: String!): String {
+    let file(name: String!): String! {
+      text(ws, if (root == ".") { name } else { root + "/" + name })
+    }
+    let version = `([0-9]+\.[0-9]+\.[0-9]+[-+.0-9A-Za-z]*)`
+    let pnpm = file("pnpm-lock.yaml")
+    if (pnpm != "") {
+      let versions = pnpm.matchAll(Regexp(`@playwright/test@` + version)).map { m => m.captures[0] ?? "" }.uniq
+      if (versions.length == 1) {
+        return versions[0]
+      }
+      let importer = if (declaring == root) { "." } else { relPath(root, declaring) }
+      let block = pnpm.split("\n  " + importer + ":\n")[1] ?? pnpm.split("\n  '" + importer + "':\n")[1] ?? ""
+      let entry = block.match(Regexp(`'@playwright/test':\s*\n\s+specifier:[^\n]*\n\s+version:\s*` + version))
+      if (entry != null) {
+        return entry.captures[0]
+      }
+      return versions[0]
+    }
+    let yarn = file("yarn.lock").match(Regexp(`@playwright/test@[^\n]*:\n\s+version:?\s+"?` + version))
+    if (yarn != null) {
+      return yarn.captures[0]
+    }
+    let bun = file("bun.lock").match(Regexp(`"@playwright/test@` + version))
+    if (bun != null) {
+      return bun.captures[0]
+    }
+    let npm = file("package-lock.json").match(
+      Regexp(`"(?:[^"]*/)?node_modules/@playwright/test"\s*:\s*\{[^}]*?"version"\s*:\s*"` + version),
+    )
+    if (npm != null) {
+      return npm.captures[0]
+    }
+    null
+  }
+
+  # The version a pnpm catalog gives @playwright/test ("" for the default
+  # catalog), or null.
+  let catalogVersion(ws: Workspace!, root: String!, catalog: String!): String {
+    let yaml = text(ws, if (root == ".") { "pnpm-workspace.yaml" } else { root + "/pnpm-workspace.yaml" })
+    let section = if (catalog == "") {
+      ("\n" + yaml).split("\ncatalog:\n")[1] ?? ""
+    } else {
+      let named = ("\n" + yaml).split("\ncatalogs:\n")[1] ?? ""
+      named.split("\n  " + catalog + ":\n")[1] ?? (
+        if (named.hasPrefix("  " + catalog + ":\n")) {
+          named.trimPrefix("  " + catalog + ":\n")
+        } else { "" }
+      )
+    }
+    # The section ends at the first line indented less than its entries.
+    let indent = if (catalog == "") { "  " } else { "    " }
+    let lines = section.split("\n").takeWhile { line => line.hasPrefix(indent) or line.trimSpace == "" or line.trimSpace.hasPrefix("#") }
+    let entry = lines.join("\n").match(`['"]?@playwright/test['"]?\s*:\s*['"]?([^'"\s#]+)`)
+    if (entry == null) { null } else { entry.captures[0] }
+  }
+
+  """
+  The @playwright/test version the project resolves: from the install root's
+  lockfile (pnpm-lock.yaml, yarn.lock, bun.lock or package-lock.json), else
+  the nearest package.json that declares it (resolving pnpm catalog:
+  specifiers from pnpm-workspace.yaml). Null when none of these gives an
+  exact version.
+  """
+  playwrightVersion(ws: Workspace!): String {
+    let root = installDir(ws)
+    if (root == null) {
+      return null
+    }
+    let declaring = packageJsonMatching(ws, path, `"@playwright/test"\s*:`) ?? root
+    let locked = lockedVersion(ws, root, declaring)
+    let candidate = if (locked != null) {
+      locked
+    } else {
+      let pkg = text(ws, if (declaring == ".") { "package.json" } else { declaring + "/package.json" })
+      let spec = pkg.match(`"@playwright/test"\s*:\s*"([^"]*)"`)
+      let raw = if (spec == null) { "" } else { spec.captures[0] ?? "" }
+      if (raw.hasPrefix("catalog:")) {
+        catalogVersion(ws, root, raw.trimPrefix("catalog:").trimSpace) ?? ""
       } else {
-        `mcr.microsoft.com/playwright:v${locked}-noble`
+        raw
       }
     }
+    let clean = candidate.trimLeft("^~>=< v")
+    if (clean.containsMatch(`^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$`)) { clean } else { null }
+  }
+
+  """
+  The Playwright image this project's tests run in: baseImageAddress when
+  set, else the image for playwrightVersion, else the module's pinned
+  default.
+  """
+  imageAddress(ws: Workspace!): String! {
+    if (tool.baseImageAddress != "") {
+      return tool.baseImageAddress
+    }
+    let version = playwrightVersion(ws)
+    if (version == null) { fallbackImage } else { `mcr.microsoft.com/playwright:v${version}-noble` }
   }
 
   # servicePort is the first exposed port of the bound service
   let servicePort: Int! {
-    let svc = service
+    let svc = tool.service
     if (svc == null) {
       raise "no service bound"
     } else {
@@ -256,50 +1034,190 @@ type Playwright {
     }
   }
 
-  """
-  A container with the workspace mounted at /app, the project directory as
-  the working directory, and dependencies installed.
-  When a service is bound, PLAYWRIGHT_BASE_URL points at it — your
-  playwright.config should consume it:
-    use: { baseURL: process.env.PLAYWRIGHT_BASE_URL || "http://localhost:3000" }
-  With localhostProxy, PLAYWRIGHT_LOCALHOST_BASE_URL is also set.
-  """
-  base: Container! {
-    let ctr = if (baseCtr != null) { baseCtr } else {
-      container.from(imageAddress)
+  # The last lines of command output, for error messages.
+  let tail(output: String!, count: Int!): String! {
+    # Without colour codes, so messages read cleanly.
+    output.replaceMatches(`\x1b\[[0-9;]*m`, with: "").trimSpace.split("\n").takeLast(count).join("\n")
+  }
+
+  # Only what an install reads: every package.json, lockfiles, workspace and
+  # package-manager config, patches, and the directories the install copies
+  # (file:, link: and portal: dependencies, injected workspace packages).
+  # Source edits elsewhere don't re-run it. When the copied directories can't
+  # be worked out, the install sees the whole source instead.
+  let installInputs(ws: Workspace!, root: String!): Directory! {
+    let copied = { copiedDirs(ws, root) } rescue {
+      err: Error => null
     }
-    let prepared = ctr
-      .withMountedCache("/root/.packages", cacheVolume("playwright-packages"))
-      .withEnvVariable("npm_config_cache", "/root/.packages")
-      .withEnvVariable("YARN_CACHE_FOLDER", "/root/.packages")
-      .withEnvVariable("PNPM_HOME", "/root/.packages")
-      .withEnvVariable("BUN_INSTALL_CACHE_DIR", "/root/.packages")
-      .withDirectory("/app", source)
-      .withWorkdir("/app" + path)
+    if (copied == null) {
+      return ws.directory(wsPath(root), exclude: ["**/node_modules"])
+    }
+    ws.directory(
+      wsPath(root),
+      include: [
+        "**/package.json",
+        "pnpm-lock.yaml",
+        "pnpm-workspace.yaml",
+        ".pnpmfile.cjs",
+        "yarn.lock",
+        ".yarnrc",
+        ".yarnrc.yml",
+        ".yarn/releases/**",
+        ".yarn/plugins/**",
+        ".yarn/patches/**",
+        "bun.lock",
+        "bun.lockb",
+        "bunfig.toml",
+        "package-lock.json",
+        "npm-shrinkwrap.json",
+        "**/.npmrc",
+        "patches/**",
+      ] + copied.map { dir => dir + "/**" } + copied,
+      exclude: ["**/node_modules"],
+    )
+  }
+
+  # Paths under root, relative to it, that an install reads beyond the
+  # manifests: file:/link:/portal: dependency targets and workspace packages
+  # marked dependenciesMeta.<name>.injected, which it copies, and workspace
+  # packages' "bin" files, which it links into node_modules/.bin. Raises when
+  # the package.json files can't be searched.
+  let copiedDirs(ws: Workspace!, root: String!): [String!]! {
+    let scope = [wsPath(root)]
+    let globs = ["package.json", "!node_modules", "!.git"]
+    let normalizeFile(file: String!): String! {
+      file.trimPrefix("/").trimPrefix("./")
+    }
+    let local = ws
+      .search(paths: scope, globs: globs, pattern: `"(?:file|link|portal):[^"]+"`).{{filePath, matchedLines}}
+      .map { hit =>
+        let dir = dirOf("/" + normalizeFile(hit.filePath))
+        hit.matchedLines.matchAll(`"(?:file|link|portal):([^"]+)"`).map { m =>
+          rootPath(dir, m.captures[0] ?? ".")
+        }
+      }
+    let injectedFiles = ws
+      .search(paths: scope, globs: globs, pattern: `"injected"\s*:\s*true`, filesOnly: true).{{filePath}}
+      .map { hit => normalizeFile(hit.filePath) }
+    let names = injectedFiles.map { file =>
+      ws.file(wsPath(file)).contents.matchAll(`"([^"]+)"\s*:\s*\{\s*"injected"\s*:\s*true`).map { m =>
+        m.captures[0] ?? ""
+      }
+    }
+    let empty: [String!]! = []
+    let flatNames = names.reduce(empty) { acc, list => acc + list }
+    let injected = if (flatNames.length == 0) {
+      empty
+    } else {
+      ws
+        .search(
+          paths: scope,
+          globs: globs,
+          pattern: `"name"\s*:\s*"(?:` + flatNames.map { n => Regexp.escape(n) }.join("|") + `)"`,
+          filesOnly: true,
+        ).{{filePath}}
+        .map { hit => dirOf("/" + normalizeFile(hit.filePath)) }
+    }
+    let bins = ws
+      .search(paths: scope, globs: globs, pattern: `"bin"\s*:`, filesOnly: true).{{filePath}}
+      .map { hit =>
+        let file = normalizeFile(hit.filePath)
+        let dir = dirOf("/" + file)
+        let json = ws.file(wsPath(file)).contents
+        let single = json.match(`"bin"\s*:\s*"([^"]+)"`)
+        let targets = if (single != null) {
+          [single.captures[0] ?? ""]
+        } else {
+          let object = json.match(`"bin"\s*:\s*\{([^}]*)\}`)
+          let entries = if (object == null) { "" } else { object.captures[0] ?? "" }
+          entries.matchAll(`"[^"]+"\s*:\s*"([^"]+)"`).map { m => m.captures[0] ?? "" }
+        }
+        targets.filter { t => t != "" }.map { t => rootPath(dir, t) }
+      }
+    let all = local.reduce(empty) { acc, list => acc + list } + injected + bins.reduce(empty) { acc, list => acc + list }
+    # Only directories inside the install root can be mounted there.
+    all
+      .filter { dir => dir != root and under(root, dir) }
+      .map { dir => relPath(root, dir) }
+      .uniq
+  }
+
+  """
+  The test container: workspace mounted, dependencies installed, service bound.
+  """
+  base(ws: Workspace!): Container! {
+    let root = installDir(ws)
+    let pm = packageManager(ws)
+    let ctr = (tool.baseCtr ?? container.from(imageAddress(ws)))
+      .withMountedCache("/root/.cache/npm", cacheVolume("playwright-npm"))
+      .withEnvVariable("npm_config_cache", "/root/.cache/npm")
+      .withMountedCache("/root/.cache/pnpm-store", cacheVolume("playwright-pnpm-store"))
+      # pnpm's own launcher downloads the pnpm version a project pins.
+      .withMountedCache("/root/.local/share/pnpm", cacheVolume("playwright-pnpm-home"))
+      # Concurrent yarn 1 installs corrupt a shared cache, so one at a time.
+      .withMountedCache(
+        "/root/.cache/yarn",
+        cacheVolume("playwright-yarn"),
+        sharing: CacheSharingMode.LOCKED,
+      )
+      .withEnvVariable("YARN_CACHE_FOLDER", "/root/.cache/yarn")
+      .withMountedCache("/root/.cache/bun", cacheVolume("playwright-bun"))
+      .withEnvVariable("BUN_INSTALL_CACHE_DIR", "/root/.cache/bun")
+      .withMountedCache("/root/.cache/corepack", cacheVolume("playwright-corepack"))
+      .withEnvVariable("COREPACK_HOME", "/root/.cache/corepack")
+      .withEnvVariable("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0")
       .withEnvVariable("CI", "true")
-    # yarn and pnpm ship via corepack on Node-based images
-    let withPm = if (packageManager == "yarn" or packageManager == "pnpm") {
-      prepared.withExec(["corepack", "enable"])
+      .withEnvVariable("HUSKY", "0")
+      .withEnvVariable("SKIP_INSTALL_SIMPLE_GIT_HOOKS", "1")
+    # yarn and pnpm come from corepack, which honours the packageManager
+    # field. Images from node 25 on no longer ship corepack, and --force
+    # replaces the yarn they still ship.
+    let withPm = if (pm == "yarn" or pm == "pnpm") {
+      ctr.withExec([
+        "sh",
+        "-c",
+        "command -v corepack >/dev/null 2>&1 || npm install -g --force corepack; corepack enable",
+      ])
     } else {
-      prepared
+      ctr
     }
-    let dir = installDir
-    let installed = if (dir == null) {
+    let installed = if (root == null) {
       withPm
     } else {
-      withPm
-        .withWorkdir("/app" + dir)
-        .withExec([packageManager, "install"])
-        .withWorkdir("/app" + path)
+      # pnpm 12 ignores npm_config_store_dir, so the store is a flag.
+      let store = if (pm == "pnpm") { ["--store-dir", "/root/.cache/pnpm-store"] } else { [] }
+      let command = [pm, "install"] + store + tool.installFlags
+      let ran = withPm
+        .withDirectory(appPath(root), installInputs(ws, root))
+        .withWorkdir(appPath(root))
+        .withExec(command, expect: ReturnType.ANY)
+      let code = ran.exitCode
+      if (code != 0) {
+        raise "install failed (" + command.join(" ") + ", exit " + toString(code) + "):\n"
+          + tail(ran.stdout + "\n" + ran.stderr, 15)
+      }
+      ran
     }
-    let svc = service
-    if (svc == null) {
+    let withEnv = tool.environment.reduce(
       installed
+        .withDirectory("/app", ws.directory("/", exclude: ["**/node_modules"]))
+        .withWorkdir(appPath(path)),
+    ) { acc, pair =>
+      let key = pair.replaceMatches(`(?s)=.*$`, with: "")
+      acc.withEnvVariable(key, pair.trimPrefix(key + "="))
+    }
+    let withSetup = tool.setup.reduce(withEnv) { acc, cmd =>
+      acc.withExec(["sh", "-c", cmd])
+    }
+    let svc = tool.service
+    if (svc == null) {
+      withSetup
     } else {
-      let bound = installed
-        .withServiceBinding(serviceHostname, svc)
-        .withEnvVariable("PLAYWRIGHT_BASE_URL", `http://${serviceHostname}:${servicePort}`)
-      if (localhostProxy) {
+      let host = tool.serviceHostname
+      let bound = withSetup
+        .withServiceBinding(host, svc)
+        .withEnvVariable("PLAYWRIGHT_BASE_URL", `http://${host}:${servicePort}`)
+      if (tool.localhostProxy) {
         bound
           .withExec(["apt-get", "update", "-qq"])
           .withExec(["apt-get", "install", "-y", "-qq", "socat"])
@@ -310,37 +1228,371 @@ type Playwright {
     }
   }
 
-  # testCommand builds the exec for one shard, wrapping in a socat localhost
-  # proxy when enabled.
-  let testCommand(shard: String!): [String!]! {
-    let testArgs = ["npx", "playwright", "test"] + args + [`--shard=${shard}`]
-    if (localhostProxy and service != null) {
-      # Background socat so localhost:<port> reaches the service during the run.
-      ["sh", "-c", `socat TCP-LISTEN:${servicePort},fork,reuseaddr TCP:${serviceHostname}:${servicePort} & exec ${testArgs.join(" ")}`]
+  # testCommand runs `playwright test` with extra arguments through a shell
+  # script that receives them as "$@", so file filters are never re-parsed.
+  # It runs the project's own installed Playwright, found in node_modules/.bin
+  # at or above the project (or through Yarn Plug'n'Play), and fails clearly
+  # when there is none; only a workspace with no package.json at all falls
+  # back to npx. With the localhost proxy, socat runs in the background.
+  let testCommand(ws: Workspace!, extra: [String!]!): [String!]! {
+    let root = installDir(ws)
+    let run = if (root == null) {
+      `exec npx playwright test "$@"`
     } else {
-      testArgs
+      let rootDir = appPath(root)
+      [
+        `d="$PWD"`,
+        `while :; do`,
+        `  if [ -x "$d/node_modules/.bin/playwright" ]; then exec "$d/node_modules/.bin/playwright" test "$@"; fi`,
+        `  if [ "$d" = "${rootDir}" ] || [ "$d" = / ]; then break; fi`,
+        `  d=$(dirname "$d")`,
+        `done`,
+        `if [ -f "${rootDir}/.pnp.cjs" ]; then exec yarn playwright test "$@"; fi`,
+        `echo "@playwright/test is not installed: add it to the devDependencies of ${if (root == ".") { "package.json" } else { root + "/package.json" }} (or of a package.json between it and the project)" >&2`,
+        `exit 127`,
+      ].join("\n")
+    }
+    let proxy = if (tool.localhostProxy and tool.service != null) {
+      let host = tool.serviceHostname
+      # Dual-stack, so both 127.0.0.1 and [::1] reach the service; IPv4 only
+      # where the container has no IPv6.
+      `(socat TCP6-LISTEN:${servicePort},ipv6only=0,fork,reuseaddr TCP:${host}:${servicePort} || socat TCP-LISTEN:${servicePort},fork,reuseaddr TCP:${host}:${servicePort}) &` + "\n"
+    } else {
+      ""
+    }
+    # args go last: a variadic flag in them (--project web) would swallow
+    # file filters that came after it, and Playwright ignores filters after
+    # "--".
+    ["sh", "-c", proxy + run, "playwright"] + extra + tool.args
+  }
+
+  # Playwright reads each positional argument as a case-insensitive regexp
+  # over absolute file paths, so "a.spec.ts" also selects "aa.spec.ts". An
+  # anchored, escaped absolute path selects exactly one file.
+  let fileFilter(file: String!): String! {
+    "^" + Regexp.escape(appPath(rootPath(path, file))) + "$"
+  }
+
+  # The container for one run.
+  let runContainer(ws: Workspace!, run: PlaywrightRun!): Container! {
+    let extra = if (run.shard != "") {
+      ["--shard=" + run.shard]
+    } else {
+      run.files.map { file => fileFilter(file) }
+    }
+    base(ws).withExec(testCommand(ws, extra), expect: ReturnType.ANY)
+  }
+
+  # One run per shard: Playwright runs the whole project with its own config.
+  let wholeRuns: [PlaywrightRun!]! {
+    let n = tool.shards
+    range(n).map { i => PlaywrightRun(files: [], shard: `${i}/${n}`, project: self) }
+  }
+
+  # The given files split into at most `shards` groups, one run each.
+  let fileRuns(files: [String!]!): [PlaywrightRun!]! {
+    # "." stands for the whole project.
+    if (files.contains(".")) {
+      return wholeRuns
+    }
+    splitInto(files, tool.shards).map { group =>
+      PlaywrightRun(
+        files: group,
+        shard: "",
+        project: self,
+      )
     }
   }
 
-  """
-  Run the Playwright test suite, sharded across `shards` parallel containers.
-  """
-  test: Void @check {
-    let b = base
-    let runs = range(shards).map { i => b.withExec(testCommand(`${i}/${shards}`)) }
-    # {{ }} forces every shard concurrently, failing fast on the first error
-    runs.{{out: stdout}}
+  # Run concurrently, raising one error that lists every failing run.
+  let runAll(ws: Workspace!, runs: [PlaywrightRun!]!): Void {
+    let failures = runs.{{label, failure(ws)}}.filter { r => r.failure != null }
+    if (failures.length > 0) {
+      raise "Playwright failed in " + path + ":\n" + failures.map { r =>
+        "- " + r.label + ": " + (r.failure ?? "")
+      }.join("\n")
+    }
     null
   }
 
   """
-  Run the suite tolerating failures and return the HTML report directory
-  (reporter: 'html' must be configured). Single-run — shard report merging is
-  not yet supported.
+  Run this project's tests, sharded across `shards` containers.
   """
-  report: Directory! {
-    base
-      .withExec(testCommand("1/1"), expect: ReturnType.ANY)
-      .directory("playwright-report")
+  test(ws: Workspace!): Void {
+    runAll(ws, wholeRuns)
+  }
+
+  # Run exactly these project-relative test files.
+  let runFiles(ws: Workspace!, files: [String!]!): Void {
+    runAll(ws, fileRuns(files))
+  }
+
+  # Error message from running this project's tests, or null when they pass.
+  let testFailure(ws: Workspace!): String {
+    { test(ws); null } rescue {
+      err: Error => err.message
+    }
+  }
+
+  """
+  Test files in this project, keyed by project-relative path.
+  """
+  tests(ws: Workspace!): PlaywrightTestFiles! {
+    PlaywrightTestFiles(files: testFiles(ws), project: self)
+  }
+
+  # The project's playwright.config, as a workspace path, or "" when none.
+  let configFile(ws: Workspace!): String! {
+    let prefix = if (path == ".") { "" } else { path + "/" }
+    let present = ws.glob(prefix + "playwright.config.*").map { f => f.trimPrefix("/").trimPrefix("./") }
+    let name = configNames.filter { n => present.contains(prefix + n) }[0]
+    if (name == null) { "" } else { prefix + name }
+  }
+
+  # The first of files that can be read, with its ASCII text, or null.
+  let firstReadable(ws: Workspace!, files: [String!]!): {{file: String!, text: String!}} {
+    let file = files[0]
+    if (file == null) {
+      return null
+    }
+    let text = { ascii(ws.file(wsPath(file)).contents) } rescue {
+      err: Error => null
+    }
+    if (text != null) {
+      return {{file, text}}
+    }
+    firstReadable(ws, files.dropFirst(1))
+  }
+
+  # The settings an import names, one hop only: the imported object's own
+  # imports and spreads are not followed.
+  let importedSettings(
+    ws: Workspace!,
+    fromFile: String!,
+    spec: String!,
+    name: String!,
+  ): {{testDir: {{state: String!, values: [String!]!}}!, testMatch: {{state: String!, values: [String!]!}}!, testIgnore: {{state: String!, values: [String!]!}}!, projectsState: String!, projects: [{{testDir: {{state: String!, values: [String!]!}}!, testMatch: {{state: String!, values: [String!]!}}!, testIgnore: {{state: String!, values: [String!]!}}!}}!]!, spread: String!}}! {
+    let hit = firstReadable(ws, moduleCandidates(dirOf("/" + fromFile), spec))
+    if (hit == null) {
+      return noSettings
+    }
+    let found = exportTarget(hit.text, name)
+    if (found.kind != "object") {
+      return noSettings
+    }
+    objectSettings(hit.text, mask(hit.text), found.at, dirOf("/" + hit.file))
+  }
+
+  # What the project's config says, read statically (see README): its
+  # default export, following one relative import or re-export, and one
+  # spread whose keys the config's own keys override. Never raises.
+  let configSettings(ws: Workspace!): {{testDir: {{state: String!, values: [String!]!}}!, testMatch: {{state: String!, values: [String!]!}}!, testIgnore: {{state: String!, values: [String!]!}}!, projectsState: String!, projects: [{{testDir: {{state: String!, values: [String!]!}}!, testMatch: {{state: String!, values: [String!]!}}!, testIgnore: {{state: String!, values: [String!]!}}!}}!]!, spread: String!}}! {
+    let file = configFile(ws)
+    let read = if (file == "") { null } else { firstReadable(ws, [file]) }
+    if (read == null) {
+      return noSettings
+    }
+    let source = read.text
+    let found = configTarget(source)
+    if (found.kind == "import") {
+      return importedSettings(ws, file, found.from, found.name)
+    }
+    if (found.kind != "object") {
+      return noSettings
+    }
+    let masked = mask(source)
+    let fileDir = dirOf("/" + file)
+    let own = objectSettings(source, masked, found.at, fileDir)
+    if (own.spread == "") {
+      return own
+    }
+    let spread = identTarget(masked, uncomment(source), own.spread)
+    let base = if (spread.kind == "object") {
+      objectSettings(source, masked, spread.at, fileDir)
+    } else if (spread.kind == "import") {
+      importedSettings(ws, file, spread.from, spread.name)
+    } else {
+      noSettings
+    }
+    mergeSettings(base, own)
+  }
+
+  # Test files come from one ripgrep search over the project's test
+  # directories, filtered by testMatch and testIgnore as read statically from
+  # its config (see README), so listing runs no container. node_modules and
+  # .git are pruned by the search itself. Config files come back from the
+  # same search and mark nested projects, whose files are left out. Search
+  # lists only files with content, so empty files are not keys. Keys are
+  # byte-ordered, so they are stable.
+  let testFiles(ws: Workspace!): [String!]! {
+    let specs = specsOf(configSettings(ws), path)
+    let defaultMatch = globRegex(defaultTestMatch) ?? ""
+    let custom = specs.any { spec => spec.match.join("\n") != defaultMatch }
+    # Playwright's default testMatch as search globs; any other testMatch
+    # searches every script file and filters below.
+    let candidates = if (custom) {
+      "*.{js,jsx,ts,tsx,mjs,cjs,mts,cts,mjsx,cjsx,mtsx,ctsx}"
+    } else {
+      "*.{spec,test}.{js,jsx,ts,tsx,mjs,cjs,mts,cts,mjsx,cjsx,mtsx,ctsx}"
+    }
+    let roots = specs.map { spec => spec.dir }.uniq
+    let found = {
+      ws
+        .search(
+          paths: roots.map { dir => wsPath(dir) },
+          globs: [candidates, "playwright.config.{ts,js,mjs,cjs,mts,cts}", "!node_modules", "!.git"],
+          pattern: "",
+          filesOnly: true,
+        ).{{filePath}}
+        .map { result => result.filePath.trimPrefix("/").trimPrefix("./") }
+    } rescue {
+      err: Error => [] :: [String!]!
+    }
+    let isConfig(file: String!): Boolean! {
+      configNames.contains(file.split("/").takeLast(1).join(""))
+    }
+    let nested = found
+      .filter { file => isConfig(file) }
+      .map { file => dirOf("/" + file) }
+      .filter { dir => dir != path and under(path, dir) }
+    let files = found.filter { file =>
+      isConfig(file) == false
+        and nested.any { dir => under(dir, file) } == false
+        and specs.any { spec =>
+          let abs = appPath(file)
+          under(spec.dir, file)
+            and spec.match.any { re => abs.containsMatch(Regexp(re)) }
+            and spec.ignore.any { re => abs.containsMatch(Regexp(re)) } == false
+        }
+    }
+    let keys = sorted(files.map { file => relPath(path, file) }.uniq)
+    # A project whose files can't be found statically still gets one key,
+    # ".", which runs the whole project.
+    if (keys.length == 0) { ["."] } else { keys }
+  }
+
+  """
+  HTML report from running this project's tests, tolerating failures.
+  """
+  report(ws: Workspace!): Directory! {
+    # The html reporter is added whatever the config uses, and writes to a
+    # fixed directory.
+    base(ws)
+      .withEnvVariable("PLAYWRIGHT_HTML_OUTPUT_DIR", "/tmp/playwright-report")
+      .withEnvVariable("PLAYWRIGHT_HTML_OPEN", "never")
+      .withExec(testCommand(ws, ["--reporter=list,html"]), expect: ReturnType.ANY)
+      .directory("/tmp/playwright-report")
+  }
+}
+
+"""
+Test files in a Playwright project, keyed by project-relative path.
+"""
+type PlaywrightTestFiles @collection {
+  """
+  Test file paths, relative to the project directory.
+  """
+  files: [String!]! @keys
+
+  """
+  Test files selected in or out since the collection was discovered.
+  """
+  delta: CollectionDelta
+
+  let project: PlaywrightProject!
+
+  """
+  The test file at this project-relative path.
+  """
+  file(path: String!): PlaywrightTestFile! @get {
+    PlaywrightTestFile(path: path, project: project)
+  }
+
+  """
+  The containers a test of the selected files runs: one per shard when
+  nothing is filtered out, else the selected files split into up to `shards`
+  groups.
+  """
+  runs: [PlaywrightRun!]! {
+    # With nothing selected out, run the project natively with its own config
+    # rather than naming every file. Without a delta, the explicit list is
+    # the safe choice.
+    let whole = if (delta == null) {
+      false
+    } else {
+      delta.addedKeys.length == 0 and delta.removedKeys.length == 0
+    }
+    if (whole) { project.wholeRuns } else { project.fileRuns(files) }
+  }
+
+  """
+  Run the selected test files in this project.
+  """
+  test(ws: Workspace!): Void @check {
+    project.runAll(ws, runs)
+  }
+}
+
+"""
+A Playwright test file.
+"""
+type PlaywrightTestFile {
+  """
+  Test file path, relative to the project directory.
+  """
+  path: String!
+
+  let project: PlaywrightProject!
+
+  """
+  Run this test file.
+  """
+  test(ws: Workspace!): Void @check {
+    project.runFiles(ws, [path])
+  }
+}
+
+"""
+One test container: a shard of a whole project, or a group of selected files.
+"""
+type PlaywrightRun {
+  """
+  Test files this run is limited to, relative to the project. Empty for a
+  shard of the whole project.
+  """
+  files: [String!]!
+
+  """
+  The shard of the whole project this run covers ("1/2"), or empty.
+  """
+  shard: String!
+
+  let project: PlaywrightProject!
+
+  """
+  What this run covers, for messages.
+  """
+  label: String! {
+    if (shard != "") { "shard " + shard } else { files.join(", ") }
+  }
+
+  # Error message from this run, or null when it passes.
+  let failure(ws: Workspace!): String {
+    {
+      let ran = project.runContainer(ws, self)
+      let code = ran.exitCode
+      if (code == 0) {
+        null
+      } else if (code == 127) {
+        ran.stderr.trim(" \n")
+      } else {
+        "playwright test failed (exit " + toString(code) + "):\n" + project.tail(
+          ran.stdout + "\n" + ran.stderr,
+          15,
+        )
+      }
+    } rescue {
+      err: Error => err.message
+    }
   }
 }
