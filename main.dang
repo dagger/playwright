@@ -633,6 +633,11 @@ type Playwright {
   args: [String!]!
 
   """
+  Playwright reporters every run uses, alongside the telemetry reporter.
+  """
+  reporters: [String!]!
+
+  """
   Number of parallel shards each project's tests run in.
   """
   shards: Int!
@@ -695,6 +700,16 @@ type Playwright {
     """
     args: [String!]! = [],
     """
+    Playwright reporters every run uses, in place of the config's: built-in
+    names, paths relative to the project, or installed packages (e.g.
+    ["list", "junit"]). The telemetry reporter is always added. The flag
+    can't carry reporter options; built-in reporters read theirs from
+    environment variables such as PLAYWRIGHT_JUNIT_OUTPUT_FILE (see
+    `environment`). When none of them prints to the terminal, Playwright adds
+    the dot reporter.
+    """
+    reporters: [String!]! = ["list"],
+    """
     Number of parallel test shards each project's tests run in.
     """
     shards: Int! = 1,
@@ -715,6 +730,7 @@ type Playwright {
     self.environment = environment
     self.localhostProxy = localhostProxy
     self.args = args
+    self.reporters = reporters
     self.shards = shards
     self.setup = setup
     self
@@ -1266,6 +1282,40 @@ type PlaywrightProject {
     ["sh", "-c", proxy + run, "playwright"] + extra + tool.args
   }
 
+  # Where the telemetry reporter is mounted in test containers.
+  let reporterDir: String! = "/opt/dagger-playwright"
+
+  # The reporter that sends each test, its steps and its output to Dagger as
+  # OpenTelemetry, built with its runtime dependencies only. Built in a pinned
+  # image, so it does not depend on the project's container.
+  let reporterLibrary: Directory! {
+    let source = currentModule.source.directory("reporter").filter(exclude: ["node_modules", "dist"])
+    let bun = container
+      .from("oven/bun:1.3.0-alpine@sha256:37e6b1cbe053939bccf6ae4507977ed957eaa6e7f275670b72ad6348e0d2c11f")
+      .withMountedCache("/root/.bun/install/cache", cacheVolume("playwright-reporter-bun"))
+      .withEnvVariable("BUN_INSTALL_CACHE_DIR", "/root/.bun/install/cache")
+    let dist = bun
+      .withDirectory("/src", source)
+      .withWorkdir("/src")
+      .withExec(["bun", "install", "--frozen-lockfile"])
+      .withExec(["bun", "run", "build"])
+      .directory("/src/dist")
+    bun
+      .withDirectory("/lib", source.filter(include: ["package.json", "bun.lock"]))
+      .withWorkdir("/lib")
+      .withExec(["bun", "install", "--frozen-lockfile", "--production"])
+      .withDirectory("dist", dist)
+      .directory("/lib")
+  }
+
+  # The --reporter flag for a run: the given reporters plus the telemetry
+  # reporter. It replaces the config's reporters, and a --reporter in args,
+  # which comes later, replaces it. Reporter names can't hold commas, which
+  # Playwright splits the flag on.
+  let reporterFlag(reporters: [String!]!): String! {
+    "--reporter=" + (reporters + [reporterDir + "/dist/reporter.js"]).join(",")
+  }
+
   # Playwright reads each positional argument as a case-insensitive regexp
   # over absolute file paths, so "a.spec.ts" also selects "aa.spec.ts". An
   # anchored, escaped absolute path selects exactly one file.
@@ -1275,12 +1325,15 @@ type PlaywrightProject {
 
   # The container for one run.
   let runContainer(ws: Workspace!, run: PlaywrightRun!): Container! {
-    let extra = if (run.shard != "") {
+    let selection = if (run.shard != "") {
       ["--shard=" + run.shard]
     } else {
       run.files.map { file => fileFilter(file) }
     }
-    base(ws).withExec(testCommand(ws, extra), expect: ReturnType.ANY)
+    # Mounted last, so a change to the reporter doesn't redo the install.
+    base(ws)
+      .withMountedDirectory(reporterDir, reporterLibrary)
+      .withExec(testCommand(ws, [reporterFlag(tool.reporters)] + selection), expect: ReturnType.ANY)
   }
 
   # One run per shard: Playwright runs the whole project with its own config.
@@ -1475,12 +1528,14 @@ type PlaywrightProject {
   HTML report from running this project's tests, tolerating failures.
   """
   report(ws: Workspace!): Directory! {
-    # The html reporter is added whatever the config uses, and writes to a
-    # fixed directory.
+    # The html reporter is added whatever the config and the reporters
+    # setting use, and writes to a fixed directory.
+    let reporters = if (tool.reporters.contains("html")) { tool.reporters } else { tool.reporters + ["html"] }
     base(ws)
+      .withMountedDirectory(reporterDir, reporterLibrary)
       .withEnvVariable("PLAYWRIGHT_HTML_OUTPUT_DIR", "/tmp/playwright-report")
       .withEnvVariable("PLAYWRIGHT_HTML_OPEN", "never")
-      .withExec(testCommand(ws, ["--reporter=list,html"]), expect: ReturnType.ANY)
+      .withExec(testCommand(ws, [reporterFlag(reporters)]), expect: ReturnType.ANY)
       .directory("/tmp/playwright-report")
   }
 }
