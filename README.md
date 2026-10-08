@@ -199,8 +199,40 @@ dagger shell playwright/projects/base --playwright-project=apps/web
 dagger api call playwright project --path=apps/web report export --path=./playwright-report
 ```
 
-`report` runs the whole project once with `--reporter=list,html`, so the HTML
-report exists whatever reporters the config sets.
+`report` runs the whole project once with the [`reporters`](#settings) plus
+`html` (and [telemetry](#telemetry)), so the HTML report exists whatever
+reporters the config sets.
+
+## Telemetry
+
+Every run sends its tests to Dagger as OpenTelemetry spans and logs, so they
+show up live in the TUI and in Dagger Cloud and are counted in the test
+summary. You don't add anything to your project for this:
+
+- **Spans**: project (when the config names one) › file › `describe` blocks ›
+  test › steps. Steps are Playwright's own: hooks, fixtures, page actions
+  (`page.goto`, `locator.click`), `expect` calls and `test.step` blocks.
+- **One span per test**, carrying its final outcome, so a test counts once.
+  Its first run's steps are on it, and each retry is a `retry #N` child span,
+  like the Run and Retry tabs of the HTML report. A flaky test (fails, then
+  passes on retry) counts as passed.
+- **Logs**: a test's stdout and stderr, and its errors with the code snippet,
+  are attached to its span.
+- **Attributes**: tests and suites use the OpenTelemetry test conventions
+  (`test.case.name`, `test.case.result.status`, `test.suite.name`,
+  `test.suite.run.status`) and `dagger.io/ui.boundary`; steps carry
+  `playwright.step.category`.
+
+The telemetry comes from a reporter (in [`reporter/`](reporter/)) that is
+mounted into the test container and passed after the `reporters` setting, as
+`--reporter=list,/opt/dagger-playwright/dist/reporter.js` by default. As with
+any `--reporter` flag, this replaces the reporters your config sets: list the
+ones you want in `reporters`. Passing `--reporter` in the `args` setting
+replaces the whole flag and turns the telemetry off.
+
+Playwright runs test code in worker processes and reports to its runner, where
+reporters live. So spans that a test's own code creates (a Dagger SDK call
+from a test, say) are not nested under that test's span.
 
 ## Working directory awareness
 
@@ -352,6 +384,14 @@ They apply to every project:
   invocation, e.g. `["--project", "chromium"]`. They come after the module's
   own arguments, so a flag that takes several values doesn't swallow the
   file filters.
+- **`reporters`** (default `["list"]`): the Playwright reporters every run
+  uses in place of the config's, with the telemetry reporter always added:
+  built-in names, paths relative to the project, or installed packages, e.g.
+  `["list", "junit"]`. The `--reporter` flag can't carry options, but the
+  built-in reporters read them from environment variables, which
+  `environment` sets, e.g. `["PLAYWRIGHT_JUNIT_OUTPUT_FILE=results.xml"]`.
+  When none of them prints to the terminal, Playwright adds `dot`, so a
+  failure still shows the end of the output.
 - **`setup`** (default `[]`): shell commands run in the project directory
   after dependencies are installed and the full source is in place, before
   the tests, e.g. `["pnpm --filter @acme/sdk build"]` to build a workspace
@@ -432,3 +472,8 @@ groups, failures).
 lookups, both collections (keys, `get`, `subset`, batches), static config
 reading, whole and filtered runs, version derivation, service wiring, the
 localhost proxy, and sharding end to end.
+
+The telemetry reporter is a small TypeScript package in `reporter/`, built with
+bun by the module itself. After changing its dependencies, refresh
+`reporter/bun.lock` with `bun install` in that directory. `bun run lint`
+checks it with Biome.

@@ -473,6 +473,16 @@ type E2e {
     assert(failure.contains("- tests/aa.spec.ts:"), "the failing group was not reported: " + failure)
     assert(failure.contains("- tests/a.spec.ts:") == false, "a passing group was reported: " + failure)
 
+    # The reporters setting replaces list: junit without an output file
+    # prints its XML, which ends the failure's output.
+    let junit = {
+      run(playwright(reporters: ["junit"]).projects(ws).get(key: "runs").tests(ws).get(key: aa).test(ws))
+      "unexpected success"
+    } rescue {
+      err: Error => err.message
+    }
+    assert(junit.contains("</testsuites>"), "the reporters setting was not used: " + junit)
+
     # The whole run is one container per shard, and it fails.
     let whole = tests.batch.runs.{{files, shard}}
     assert(
