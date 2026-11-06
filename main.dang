@@ -30,6 +30,14 @@ let sorted(items: [String!]!): [String!]! {
   }
 }
 
+# inOrder reports whether items are already in byte order, as discovery
+# returns keys, so the common case skips sorted's quadratic work.
+let inOrder(items: [String!]!): Boolean! {
+  items.reduce({{last: "", ok: true}}) { acc, item =>
+    {{last: item, ok: acc.ok and acc.last <= item}}
+  }.ok
+}
+
 # rootPath resolves a path — cwd-relative, or absolute from the workspace
 # root — to a workspace-root-relative path ("." is the workspace root).
 let rootPath(cwd: String!, p: String!): String! {
@@ -292,6 +300,26 @@ let uncomment(source: String!): String! {
   }
 }
 
+# The source text a top-level `const name = <value>` (or let/var) binds name
+# to, up to its end: a whole bracketed array, else the rest of the statement.
+# Null when name is no identifier or isn't bound that way in the file.
+let boundLiteral(source: String!, masked: String!, name: String!): String {
+  if (name.containsMatch(`^[A-Za-z_$][A-Za-z0-9_$]*$`) == false) {
+    return null
+  }
+  let decl = masked.match(Regexp(`(?:^|[;\n])\s*(?:export\s+)?(?:const|let|var)\s+` + Regexp.escape(name) + `\s*(?::[^=;]*)?=\s*`))
+  if (decl == null) {
+    return null
+  }
+  let at = decl.end
+  if (slice(masked, at, at + 1) == "[") {
+    let group = groupAt(masked, at)
+    return if (group == null) { null } else { slice(source, at, at + size(group)) }
+  }
+  let rest = slice(masked, at, size(masked)).match(`^[^;\n]*`)
+  if (rest == null) { null } else { slice(source, at, at + rest.end) }
+}
+
 # testDir, testMatch and testIgnore of the object at start. testDir values
 # are relative to the config directory, or "@<workspace path>" when written
 # with __dirname (which is the file's own directory, fileDir).
@@ -312,18 +340,22 @@ let fieldsAt(source: String!, masked: String!, start: Int!, fileDir: String!): {
     }
     let value = slice(body, hit.end, length).match(`^[^,}]*`)
     let text = slice(source, start + hit.end, start + hit.end + (if (value == null) { 0 } else { value.end }))
-    let values = if (parse == "dir") {
-      let dir = dirValue(text)
-      if (dir == null) {
-        null
-      } else if (dir.hasPrefix("__dirname/")) {
-        ["@" + rootPath(fileDir, dir.trimPrefix("__dirname/"))]
+    let parsed(text: String!): [String!] {
+      if (parse == "dir") {
+        let dir = dirValue(text)
+        if (dir == null) {
+          null
+        } else if (dir.hasPrefix("__dirname/")) {
+          ["@" + rootPath(fileDir, dir.trimPrefix("__dirname/"))]
+        } else {
+          [dir]
+        }
       } else {
-        [dir]
+        patternsValue(text)
       }
-    } else {
-      patternsValue(text)
     }
+    # A bare identifier reads the literal a const in the same file binds it to.
+    let values = parsed(text) ?? parsed(boundLiteral(source, masked, text.trimSpace) ?? "")
     if (values == null) { field("dynamic", []) } else { field("literal", values) }
   }
   {{
@@ -1250,22 +1282,26 @@ type PlaywrightProject {
   # at or above the project (or through Yarn Plug'n'Play), and fails clearly
   # when there is none; only a workspace with no package.json at all falls
   # back to npx. With the localhost proxy, socat runs in the background.
+  #
+  # Playwright's stdout, stderr and exit status are kept in resultsDir for the
+  # indexer, then replayed, so the exec's own output still shows them. The
+  # script always exits with Playwright's status.
   let testCommand(ws: Workspace!, extra: [String!]!): [String!]! {
     let root = installDir(ws)
     let run = if (root == null) {
-      `exec npx playwright test "$@"`
+      `  npx playwright test "$@"`
     } else {
       let rootDir = appPath(root)
       [
-        `d="$PWD"`,
-        `while :; do`,
-        `  if [ -x "$d/node_modules/.bin/playwright" ]; then exec "$d/node_modules/.bin/playwright" test "$@"; fi`,
-        `  if [ "$d" = "${rootDir}" ] || [ "$d" = / ]; then break; fi`,
-        `  d=$(dirname "$d")`,
-        `done`,
-        `if [ -f "${rootDir}/.pnp.cjs" ]; then exec yarn playwright test "$@"; fi`,
-        `echo "@playwright/test is not installed: add it to the devDependencies of ${if (root == ".") { "package.json" } else { root + "/package.json" }} (or of a package.json between it and the project)" >&2`,
-        `exit 127`,
+        `  d="$PWD"`,
+        `  while :; do`,
+        `    if [ -x "$d/node_modules/.bin/playwright" ]; then "$d/node_modules/.bin/playwright" test "$@"; return; fi`,
+        `    if [ "$d" = "${rootDir}" ] || [ "$d" = / ]; then break; fi`,
+        `    d=$(dirname "$d")`,
+        `  done`,
+        `  if [ -f "${rootDir}/.pnp.cjs" ]; then yarn playwright test "$@"; return; fi`,
+        `  echo "@playwright/test is not installed: add it to the devDependencies of ${if (root == ".") { "package.json" } else { root + "/package.json" }} (or of a package.json between it and the project)" >&2`,
+        `  return 127`,
       ].join("\n")
     }
     let proxy = if (tool.localhostProxy and tool.service != null) {
@@ -1276,22 +1312,42 @@ type PlaywrightProject {
     } else {
       ""
     }
+    let script = [
+      `o=${resultsDir}`,
+      `mkdir -p "$o"`,
+      `pw() {`,
+      run,
+      `}`,
+      `pw "$@" >"$o/stdout" 2>"$o/stderr"`,
+      `code=$?`,
+      `echo "$code" >"$o/exit"`,
+      `cat "$o/stdout"`,
+      `cat "$o/stderr" >&2`,
+      `exit "$code"`,
+    ].join("\n")
     # args go last: a variadic flag in them (--project web) would swallow
     # file filters that came after it, and Playwright ignores filters after
     # "--".
-    ["sh", "-c", proxy + run, "playwright"] + extra + tool.args
+    ["sh", "-c", proxy + script, "playwright"] + extra + tool.args
   }
+
+  # Where a run keeps Playwright's output, exit status and results record.
+  let resultsDir: String! = "/tmp/dagger-playwright"
+
+  # A pinned bun image: it builds the reporters and runs the indexer.
+  let bunImage: String! = "oven/bun:1.3.0-alpine@sha256:37e6b1cbe053939bccf6ae4507977ed957eaa6e7f275670b72ad6348e0d2c11f"
 
   # Where the telemetry reporter is mounted in test containers.
   let reporterDir: String! = "/opt/dagger-playwright"
 
-  # The reporter that sends each test, its steps and its output to Dagger as
-  # OpenTelemetry, built with its runtime dependencies only. Built in a pinned
+  # The reporters, built with their runtime dependencies only: reporter.js
+  # sends each test, its steps and its output to Dagger as OpenTelemetry, and
+  # results.js records what a run did for the indexer. Built in a pinned
   # image, so it does not depend on the project's container.
   let reporterLibrary: Directory! {
-    let source = currentModule.source.directory("reporter").filter(exclude: ["node_modules", "dist"])
+    let source = currentModule.source.directory("reporter").filter(exclude: ["node_modules", "dist", "src/indexer.ts"])
     let bun = container
-      .from("oven/bun:1.3.0-alpine@sha256:37e6b1cbe053939bccf6ae4507977ed957eaa6e7f275670b72ad6348e0d2c11f")
+      .from(bunImage)
       .withMountedCache("/root/.bun/install/cache", cacheVolume("playwright-reporter-bun"))
       .withEnvVariable("BUN_INSTALL_CACHE_DIR", "/root/.bun/install/cache")
     let dist = bun
@@ -1309,11 +1365,11 @@ type PlaywrightProject {
   }
 
   # The --reporter flag for a run: the given reporters plus the telemetry
-  # reporter. It replaces the config's reporters, and a --reporter in args,
-  # which comes later, replaces it. Reporter names can't hold commas, which
-  # Playwright splits the flag on.
-  let reporterFlag(reporters: [String!]!): String! {
-    "--reporter=" + (reporters + [reporterDir + "/dist/reporter.js"]).join(",")
+  # reporter, and any extra module reporters. It replaces the config's
+  # reporters, and a --reporter in args, which comes later, replaces it.
+  # Reporter names can't hold commas, which Playwright splits the flag on.
+  let reporterFlag(reporters: [String!]!, extra: [String!]! = []): String! {
+    "--reporter=" + (reporters + [reporterDir + "/dist/reporter.js"] + extra).join(",")
   }
 
   # Playwright reads each positional argument as a case-insensitive regexp
@@ -1323,7 +1379,8 @@ type PlaywrightProject {
     "^" + Regexp.escape(appPath(rootPath(path, file))) + "$"
   }
 
-  # The container for one run.
+  # The container for one run. It never fails on Playwright's exit status:
+  # the indexer reads the status along with the results record.
   let runContainer(ws: Workspace!, run: PlaywrightRun!): Container! {
     let selection = if (run.shard != "") {
       ["--shard=" + run.shard]
@@ -1333,7 +1390,11 @@ type PlaywrightProject {
     # Mounted last, so a change to the reporter doesn't redo the install.
     base(ws)
       .withMountedDirectory(reporterDir, reporterLibrary)
-      .withExec(testCommand(ws, [reporterFlag(tool.reporters)] + selection), expect: ReturnType.ANY)
+      .withEnvVariable("DAGGER_PLAYWRIGHT_RESULTS", resultsDir + "/results.jsonl")
+      .withExec(
+        testCommand(ws, [reporterFlag(tool.reporters, [reporterDir + "/dist/results.js"])] + selection),
+        expect: ReturnType.ANY,
+      )
   }
 
   # One run per shard: Playwright runs the whole project with its own config.
@@ -1342,42 +1403,69 @@ type PlaywrightProject {
     range(n).map { i => PlaywrightRun(files: [], shard: `${i}/${n}`, project: self) }
   }
 
-  # The given files split into at most `shards` groups, one run each.
-  let fileRuns(files: [String!]!): [PlaywrightRun!]! {
-    # "." stands for the whole project.
-    if (files.contains(".")) {
+  """
+  The containers `test` starts: one per shard, each running a share of the
+  whole project with --shard.
+  """
+  runs: [PlaywrightRun!]! {
+    wholeRuns
+  }
+
+  # The runs for a selection of files, in key order: the whole project when
+  # nothing was selected out, else the files split into
+  # at most `shards` groups. Depends only on the selection, so every check of
+  # the project plans the same runs.
+  let plannedRuns(files: [String!]!, narrowed: Boolean!): [PlaywrightRun!]! {
+    if (narrowed == false) {
       return wholeRuns
     }
     splitInto(files, tool.shards).map { group =>
-      PlaywrightRun(
-        files: group,
-        shard: "",
-        project: self,
-      )
+      PlaywrightRun(files: group, shard: "", project: self)
     }
   }
 
-  # Run concurrently, raising one error that lists every failing run.
-  let runAll(ws: Workspace!, runs: [PlaywrightRun!]!): Void {
-    let failures = runs.{{label, failure(ws)}}.filter { r => r.failure != null }
-    if (failures.length > 0) {
-      raise "Playwright failed in " + path + ":\n" + failures.map { r =>
-        "- " + r.label + ": " + (r.failure ?? "")
-      }.join("\n")
-    }
-    null
+  # The indexer: a standalone script run by bun in a pinned image, kept out
+  # of reporterLibrary so changing it doesn't re-run the tests.
+  let indexerScript: File! {
+    currentModule.source.file("reporter/src/indexer.ts")
   }
 
   """
-  Run this project's tests, sharded across `shards` containers.
+  One shared run of the selected test files, and the result of each.
+
+  Every test-file check of the project calls this with the same selection,
+  so the runs and the indexer step are the same operations in each, and the
+  engine runs them once. Nothing here depends on which check is asking.
+  """
+  let runTests(ws: Workspace!, files: [String!]!, narrowed: Boolean!): PlaywrightResults! {
+    let keys = if (inOrder(files)) { files } else { sorted(files) }
+    let runs = plannedRuns(keys, narrowed)
+    let selection = {{
+      config: configFile(ws),
+      files: keys.map { key => {{key: key, path: appPath(rootPath(path, key))}} },
+      runs: range(runs.length).map { i =>
+        let r = runs[i - 1]!
+        {{dir: "/in/" + toString(i), label: r.label, keys: if (r.shard != "") { keys } else { r.files }}}
+      }
+    }}
+    let inputs = range(runs.length).reduce(
+      container
+        .from(bunImage)
+        .withFile("/indexer/indexer.ts", indexerScript)
+        .withNewFile("/in/selection.json", JSON.encode(selection)),
+    ) { ctr, i =>
+      ctr.withDirectory("/in/" + toString(i), runContainer(ws, runs[i - 1]!).directory(resultsDir))
+    }
+    let indexed = inputs.withExec(["bun", "/indexer/indexer.ts", "/in/selection.json", "/out"])
+    PlaywrightResults(results: indexed.directory("/out"), keys: keys, project: self)
+  }
+
+  """
+  Run this project's tests, sharded across `shards` containers. A plain
+  function: the checks are per test file.
   """
   test(ws: Workspace!): Void {
-    runAll(ws, wholeRuns)
-  }
-
-  # Run exactly these project-relative test files.
-  let runFiles(ws: Workspace!, files: [String!]!): Void {
-    runAll(ws, fileRuns(files))
+    runTests(ws, testFiles(ws), false).assertAllPassed
   }
 
   # Error message from running this project's tests, or null when they pass.
@@ -1518,10 +1606,9 @@ type PlaywrightProject {
             and spec.ignore.any { re => abs.containsMatch(Regexp(re)) } == false
         }
     }
-    let keys = sorted(files.map { file => relPath(path, file) }.uniq)
-    # A project whose files can't be found statically still gets one key,
-    # ".", which runs the whole project.
-    if (keys.length == 0) { ["."] } else { keys }
+    # A project with no test file found statically offers no checks: keys
+    # are only files Playwright can be told to run.
+    sorted(files.map { file => relPath(path, file) }.uniq)
   }
 
   """
@@ -1552,7 +1639,14 @@ type PlaywrightTestFiles @collection {
   """
   Test files selected in or out since the collection was discovered.
   """
-  delta: CollectionDelta
+  delta: CollectionDelta @delta
+
+  """
+  Whether the active selection removed test files from this collection. Without
+  a delta (a direct API call), the selection counts as narrowed: the safe
+  choice, which names every file.
+  """
+  narrowed: Boolean! { delta == null or delta!.removedKeys.length > 0 }
 
   let project: PlaywrightProject!
 
@@ -1564,27 +1658,23 @@ type PlaywrightTestFiles @collection {
   }
 
   """
-  The containers a test of the selected files runs: one per shard when
-  nothing is filtered out, else the selected files split into up to `shards`
+  The containers a run of the selected files starts: one per shard when
+  nothing is selected out, else the selected files split into up to `shards`
   groups.
   """
   runs: [PlaywrightRun!]! {
-    # With nothing selected out, run the project natively with its own config
-    # rather than naming every file. Without a delta, the explicit list is
-    # the safe choice.
-    let whole = if (delta == null) {
-      false
-    } else {
-      delta.addedKeys.length == 0 and delta.removedKeys.length == 0
-    }
-    if (whole) { project.wholeRuns } else { project.fileRuns(files) }
+    project.plannedRuns(if (inOrder(files)) { files } else { sorted(files) }, narrowed)
   }
 
   """
-  Run the selected test files in this project.
+  Run the selected test files in one shared run, raising one error that lists
+  every failing file. A plain function: the checks are per test file.
   """
-  test(ws: Workspace!): Void @check {
-    project.runAll(ws, runs)
+  test(ws: Workspace!): Void {
+    if (files.length > 0) {
+      project.runTests(ws, files, narrowed).assertAllPassed
+    }
+    null
   }
 }
 
@@ -1601,9 +1691,14 @@ type PlaywrightTestFile {
 
   """
   Run this test file.
+
+  selection is the project's test files as the active selection filtered
+  them; the engine supplies it. Every selected file of the project calls the
+  same shared run with it, so Playwright runs once per project, and this
+  check reads only its own file's result.
   """
-  test(ws: Workspace!): Void @check {
-    project.runFiles(ws, [path])
+  test(ws: Workspace!, selection: PlaywrightTestFiles!): Void @check {
+    project.runTests(ws, selection.files, selection.narrowed).assertPassed(path)
   }
 }
 
@@ -1630,24 +1725,53 @@ type PlaywrightRun {
   label: String! {
     if (shard != "") { "shard " + shard } else { files.join(", ") }
   }
+}
 
-  # Error message from this run, or null when it passes.
-  let failure(ws: Workspace!): String {
-    {
-      let ran = project.runContainer(ws, self)
-      let code = ran.exitCode
-      if (code == 0) {
-        null
-      } else if (code == 127) {
-        ran.stderr.trim(" \n")
-      } else {
-        "playwright test failed (exit " + toString(code) + "):\n" + project.tail(
-          ran.stdout + "\n" + ran.stderr,
-          15,
-        )
-      }
-    } rescue {
-      err: Error => err.message
+# The result of each selected file of one shared run, as the indexer wrote
+# them: results/<rank> is empty when the file at that rank in keys passed,
+# else its failure. Each result is bounded, however large the run's output.
+type PlaywrightResults {
+  let results: Directory!
+  let keys: [String!]!
+  let project: PlaywrightProject!
+
+  # Where a test file is, relative to the workspace, for messages.
+  let where(file: String!): String! {
+    rootPath(project.path, file)
+  }
+
+  # Raise the failure recorded for one selected file.
+  let assertPassed(file: String!): Void {
+    if (keys.contains(file) == false) {
+      raise "Playwright test file is outside the selection: " + where(file)
     }
+    # Ranks count strictly smaller keys, in the byte order keys are sorted in.
+    let rank = keys.filter { key => key < file }.length
+    let failure = results.file(toString(rank)).contents
+    if (failure != "") {
+      raise "Playwright tests in " + where(file) + ": " + failure
+    }
+    null
+  }
+
+  # Raise one error listing every selected file that failed, or, with no
+  # files to blame, the run's own failure.
+  let assertAllPassed: Void {
+    if (keys.length == 0) {
+      let failure = results.file("all").contents
+      if (failure != "") {
+        raise "Playwright failed in " + project.path + ": " + failure
+      }
+      return null
+    }
+    let failures = range(keys.length)
+      .map { i => {{key: keys[i - 1]!, failure: results.file(toString(i - 1)).contents}} }
+      .filter { r => r.failure != "" }
+    if (failures.length > 0) {
+      raise "Playwright failed in " + project.path + ":\n" + failures.map { r =>
+        "- " + r.key + ": " + r.failure
+      }.join("\n")
+    }
+    null
   }
 }
