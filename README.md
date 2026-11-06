@@ -6,7 +6,7 @@ project, with first-class [workspace service
 wiring](https://docs.dagger.io/config/module-wiring): point it at any module
 function that returns a `Service` and your tests run against it.
 
-Requires Dagger v1.0.0-beta.15 or later.
+Requires Dagger v1.0.0-beta.22 or later.
 
 ## Functions
 
@@ -21,6 +21,7 @@ On a project:
 | -------------- | ---------------------------------------------------------------------------- |
 | `tests`        | The project's test files, as a collection keyed by project-relative path.    |
 | `test`         | Run the whole project, sharded across parallel containers (a plain function; the checks are per test file). |
+| `runs`         | The containers `test` starts, one per shard.                                 |
 | `report`       | Run the tests tolerating failures; returns the HTML report `Directory`.       |
 | `base`         | The prepared test container (workspace mounted, deps installed, service bound). |
 | `imageAddress` | The resolved Playwright image (useful to debug version derivation).           |
@@ -29,9 +30,10 @@ On a project:
 | `packageManager` | The package manager that installs them.                                    |
 | `path`         | The project's config directory, relative to the workspace root.              |
 
-On the test files: `test` (the check, run as one batch over the selection) and
-`runs` (the containers that batch would start; see [Shards and
-groups](#shards-and-groups)). On a test file: `path` and `test`.
+On the test files: `test` (a plain function that runs the files in one shared
+run and lists every failing file), `runs` (the containers that run starts; see
+[Shards and groups](#shards-and-groups)) and `narrowed`. On a test file: `path`
+and `test`, the check (see [Checks and the shared run](#checks-and-the-shared-run)).
 
 ## Usage
 
@@ -70,8 +72,9 @@ $ dagger check -l --all --playwright -f=cli         # the same, as reusable flag
 $ dagger check playwright/projects/tests/test --playwright-project=apps/web --playwright-project=apps/admin
 ```
 
-The selected projects run concurrently, each in its own containers, and a
-failing run lists every run that failed. `--check test` alone also selects
+The selected projects run concurrently, each in its own containers, and each
+selected test file is its own check (see [Checks and the shared
+run](#checks-and-the-shared-run)). `--check test` alone also selects
 every other installed module's check named `test`; `--playwright` narrows it
 to this one. `dagger check --help` lists the flags in effect:
 `--playwright-project PATH`, `--playwright-projects`,
@@ -112,6 +115,8 @@ The config file is read as text and only **literal** values are honoured:
   (minimatch, case-insensitive, `**/` prepended unless present); regexes are
   matched against the file's absolute path in the test container
   (`/app/<workspace path>`).
+- Any of these written as a name (`testMatch: match`) bound by a top-level
+  `const`/`let`/`var` in the same file to one of the literals above.
 - The same three settings inside each entry of `projects: [{ … }]`. A
   Playwright project without its own value inherits the top-level one. Keys
   are the union across Playwright projects: files are the dimension, not
@@ -138,32 +143,88 @@ Anything else falls back to Playwright's defaults for that setting —
 `testDir` is the config's directory, `testMatch` is
 `**/*.@(spec|test).?(c|m)[jt]s?(x)`, and nothing is ignored:
 
-- values built from variables, environment variables, function calls or
-  template strings with `${}`;
+- values built from environment variables, expressions, function calls or
+  template strings with `${}`, and names not bound to a literal in the file;
 - imports of packages (not relative paths) and anything more than one hop
   away;
 - regexes RE2 cannot compile (lookaround, backreferences) and `!(…)` globs;
 - quoted keys (`'testDir': …`);
 - a config that can't be read or doesn't look like the shapes above.
 
-Listing never fails because of a config. A project where static discovery
-finds no test file at all still gets one key, `.`, which runs the whole
-project natively, so it can always be checked. Other limits: empty test
-files are not listed; `respectGitIgnore` is not applied; and a key that
-Playwright itself does not treat as a test (because of a setting that was not
-read) fails its run with "No tests found".
+Listing never fails because of a config, and never installs dependencies or
+runs Node or Playwright: it is answered from `findRoots`, one
+`Workspace.search` per project and reads of config text. A config Playwright
+can't load still lists with the defaults; its project's checks then fail
+alone, naming the config. A project where static discovery finds no test file
+offers no checks: keys are only files, never a stand-in for the whole project
+(the project's plain `test` function still runs it whole). Other limits:
+empty test files are not listed; `respectGitIgnore` is not applied; and a
+key that Playwright itself does not treat as a test (because of a setting
+that was not read) fails its check as not run, never passes.
+
+### Checks and the shared run
+
+Each selected test file has its own check, and every check of a project
+calls the same helper with the project's test files as the active selection
+filtered them (a selected collection argument the engine supplies). The
+helper builds the same runs, byte for byte, in every check, so the engine
+runs them once: one `playwright test` per project (per shard), however many
+of its files are selected. Separate projects run separately, concurrently.
+
+Each run records what Playwright did — the tests it planned, and each test's
+outcome and errors — with a second reporter (`reporter/src/results.ts`), and
+keeps its output and exit status; the output is replayed into the exec's own
+log when Playwright exits, while tests stream live as
+[telemetry](#telemetry). A shared indexer step (`reporter/src/indexer.ts`,
+run by bun in a pinned image) reads them once and writes one bounded result
+per selected file (32 KiB of each output stream at most, 96 KiB per result).
+Each check reads only its own:
+
+- A failing test (outcome `unexpected`; flaky tests pass) fails its file's
+  check, with each failing test's title and errors.
+- A file that fails to load fails its check. Playwright then runs no test at
+  all, so the project's other selected files fail as not run, naming it.
+- A failure in no selected file — a failing global setup, a `webServer` that
+  doesn't start, a test in a file static discovery missed, `No tests found` —
+  fails every check sharing the run, with the end of Playwright's output.
+  So does a run that fails with no failing test, or before reporting any
+  (a missing `@playwright/test`).
+- A selected file Playwright planned no test from while the run passed fails
+  as not run, rather than passing with nothing behind it: static discovery
+  and Playwright disagreed (a `testIgnore` that wasn't read), or `--grep` in
+  `args` left none of its tests.
+- Tests that never started after a failure that stopped the run
+  (`--max-failures`) are not blamed for it; a test that started and never
+  finished fails its file.
+
+A `--reporter` in `args` replaces the results reporter too, leaving nothing
+to attribute: a run that passes passes every check, and one that fails fails
+them all. Logs and test spans belong to the check that started the shared run;
+the other checks share its result, so a `TESTS` summary shows under one of
+them.
+
+The collection-level `test` functions are plain functions, not checks, so
+`dagger check` never runs the same tests twice. There is no `.batch`
+namespace.
+
+Files are the finest checks. Playwright can filter to and report single
+tests, but their titles can't be listed without running Node — titles built
+at runtime, tests declared in loops, `describe` nesting — and listing must
+stay static. Browser projects (`chromium`, `firefox`) are not a dimension
+either; pick them with `args`.
 
 ### Whole and filtered runs
 
-A test-file check runs as one batch per project over the selected files:
+The selection decides what the shared run passes to Playwright:
 
-- **Nothing filtered out** (the whole project, e.g. a bare `dagger check`, or
-  every one of a project's keys selected by name): Playwright runs the
-  project natively with its own config, split with `--shard=i/N` across N
-  containers, where N is the `shards` setting. Tests static discovery missed
-  still run.
-- **Some files selected** (`--playwright-test-file=…`): only those files run.
-  Each is passed as an anchored, escaped regex of its absolute path
+- **Nothing filtered out** (the whole project, e.g. a bare `dagger check`,
+  or `--playwright-project=…` alone): Playwright runs the project natively
+  with its own config, split with `--shard=i/N` across N containers, where N
+  is the `shards` setting. Tests static discovery missed still run, and a
+  failure among them fails the project's checks.
+- **Some files selected out** (`--playwright-test-file=…`, or a direct API
+  call, which has no delta to tell): only the selected files run, in key
+  order. Each is passed as an anchored, escaped regex of its absolute path
   (`^/app/apps/web/tests/a\.spec\.ts$`), because Playwright reads positional
   arguments as regexes — a plain `a.spec.ts` would also run `aa.spec.ts`.
 - **Nothing selected**: nothing runs.
@@ -174,21 +235,30 @@ A filtered run splits the selected files, in key order, into up to `shards`
 contiguous groups of near-equal size, one container per group, all running
 concurrently: with `shards = 2`, three files run as `[a, b]` and `[c]`, and a
 single file runs in one container. A whole run uses `--shard` instead. Either
-way, every container binds the same service, and a failure lists every
-failing shard or group:
+way, every container binds the same service, and the indexer reads all of a
+project's containers together. A failing check names its file:
+
+```
+Playwright tests in apps/web/tests/aa.spec.ts: 1 failure:
+✘ chromium › tests/aa.spec.ts › fails (failed)
+/app/apps/web/tests/aa.spec.ts:3
+Error: expect(received).toBe(expected) …
+```
+
+and the plain `test` functions list every failing file:
 
 ```
 Playwright failed in apps/web:
-- tests/a.spec.ts, tests/aa.spec.ts: playwright test failed (exit 1):
-  …the end of the output…
+- tests/aa.spec.ts: 1 failure:
+  …
 ```
 
 A failing install is named as such (`install failed (pnpm install, exit 1):`
 with the end of its output), and so is a project without Playwright
 installed.
 
-The `runs` function on the test files returns the containers a batch would
-start (`shard` for a whole run, `files` for a group).
+The `runs` function on the test files returns the containers a run of them
+starts (`shard` for a whole run, `files` for a group).
 
 Other artifacts per project:
 
@@ -224,11 +294,14 @@ summary. You don't add anything to your project for this:
   `playwright.step.category`.
 
 The telemetry comes from a reporter (in [`reporter/`](reporter/)) that is
-mounted into the test container and passed after the `reporters` setting, as
-`--reporter=list,/opt/dagger-playwright/dist/reporter.js` by default. As with
-any `--reporter` flag, this replaces the reporters your config sets: list the
-ones you want in `reporters`. Passing `--reporter` in the `args` setting
-replaces the whole flag and turns the telemetry off.
+mounted into the test container and passed after the `reporters` setting,
+with the results reporter the checks read (see [Checks and the shared
+run](#checks-and-the-shared-run)), as
+`--reporter=list,/opt/dagger-playwright/dist/reporter.js,/opt/dagger-playwright/dist/results.js`
+by default. As with any `--reporter` flag, this replaces the reporters your
+config sets: list the ones you want in `reporters`. Passing `--reporter` in
+the `args` setting replaces the whole flag and turns the telemetry and
+per-file results off.
 
 Playwright runs test code in worker processes and reports to its runner, where
 reporters live. So spans that a test's own code creates (a Dagger SDK call
@@ -427,10 +500,11 @@ single-run; shard report merging is not yet supported.)
 
 From your own module, `projects(ws)` is the collection of projects and
 `tests(ws)` on a project the collection of its test files: each has `keys`,
-`get(key:)`, `subset(keys:)`, and `batch` for running a function over the
-selection. The test-file `test` is a check, and a check called through a
-dependency comes back as a `Check` that has not run, so wrap it. The
-project-level `test` functions are plain and run when called:
+`get(key:)` and `subset(keys:)`, and a plain `test` that runs its keys. The
+test-file `test` is a check: it takes the selection whose shared run it reads
+its result from, and a check called through a dependency comes back as a
+`Check` that has not run, so wrap it. A direct call has no engine selection,
+so its delta is null and the files run by name, never whole:
 
 ```dang
 type Ci {
@@ -444,10 +518,11 @@ type Ci {
   e2e(ws: Workspace!): Void @check {
     let projects = playwright(service: myapp.serve, shards: 2).projects(ws)
     let web = projects.get(key: "apps/web").tests(ws)
-    run(web.batch.test(ws))                                         # all of apps/web, sharded
-    run(web.subset(keys: ["tests/login.spec.ts"]).batch.test(ws))   # some files
-    run(web.get(key: "tests/login.spec.ts").test(ws))               # one file
-    projects.batch.test(ws)                                         # every project, whole
+    projects.get(key: "apps/web").test(ws)                    # all of apps/web, whole and sharded
+    let some = web.subset(keys: ["tests/login.spec.ts", "tests/cart.spec.ts"])
+    some.test(ws)                                             # some files, one shared run
+    run(web.get(key: "tests/login.spec.ts").test(ws, selection: some))  # one file's result of that run
+    projects.test(ws)                                         # every project, whole
     null
   }
 
@@ -467,11 +542,19 @@ the enclosing one. Small synthetic workspaces cover config reading (one
 project per rule, including SvelteKit's and React Router's config shapes),
 install roots, package managers and image derivation, installs with pnpm,
 `installFlags` and `environment`, and filtered runs (exact file selection,
-groups, failures).
+groups, per-file results of a shared run, failures).
 `dagger check` exercises discovery (including working-directory scoping),
-lookups, both collections (keys, `get`, `subset`, batches), static config
-reading, whole and filtered runs, version derivation, service wiring, the
-localhost proxy, and sharding end to end.
+lookups, both collections (keys, `get`, `subset`, their plain `test`), static
+config reading, whole and filtered runs, version derivation, service wiring,
+the localhost proxy, and sharding end to end.
+
+The `selected-*` checks run `dagger check` itself, through the engine's own
+CLI, on small fixture workspaces that install this module: direct Dang calls
+don't apply the engine's filtered collection view, so only the CLI exercises
+selection. They cover several projects and files, files selected out not
+running, a whole run, one Playwright run per project however many files are
+selected, an isolated failing file, a failing global setup, a load error, a
+failure outside any selected file, and a selected file Playwright never ran.
 
 The telemetry reporter is a small TypeScript package in `reporter/`, built with
 bun by the module itself. After changing its dependencies, refresh

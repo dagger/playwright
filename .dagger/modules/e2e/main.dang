@@ -55,13 +55,12 @@ type E2e {
       "PLAYWRIGHT_LOCALHOST_BASE_URL is not set",
     )
     # The whole project runs natively, one container per shard.
-    let tests = project.tests(w)
-    let shards = tests.batch.runs.{{shard, files}}
+    let shards = project.runs.{{shard, files}}
     assert(
       shards.map { r => r.shard }.join(",") == "1/2,2/2",
       "a whole run is not one run per shard: " + shards.map { r => r.shard }.join(","),
     )
-    run(tests.batch.test(w))
+    project.test(w)
     null
   }
 
@@ -164,7 +163,8 @@ type E2e {
   }
 
   """
-  The projects and test-file collections support get, subset and batches.
+  The projects and test-file collections support get and subset, and their
+  plain test functions run just the selection.
   """
   collectionCheck(ws: Workspace!): Void @check {
     let w = root(ws)
@@ -195,29 +195,29 @@ type E2e {
     assert(projects.subset(keys: empty).keys.length == 0, "empty subset is not empty")
 
     # The failing project is outside the subset, so this passes only if the
-    # batch ran just its own keys.
-    only.batch.test(w)
+    # subset ran just its own keys.
+    only.test(w)
 
     # The whole collection reports the failing project, and only it.
     let failure = {
-      projects.batch.test(w)
+      projects.test(w)
       "unexpected success"
     } rescue {
       err: Error => err.message
     }
-    assert(failure.contains("- fixture:"), "batch did not report the failing project: " + failure)
-    assert(failure.contains("- fixture/nested:") == false, "batch reported a passing project: " + failure)
+    assert(failure.contains("- fixture:"), "test did not report the failing project: " + failure)
+    assert(failure.contains("- fixture/nested:") == false, "test reported a passing project: " + failure)
 
-    # With every project failing, the batch reports all of them.
+    # With every project failing, test reports all of them.
     let both = {
-      playwright(args: ["--bogus-option"]).projects(w).batch.test(w)
+      playwright(args: ["--bogus-option"]).projects(w).test(w)
       "unexpected success"
     } rescue {
       err: Error => err.message
     }
     assert(
       both.contains("- fixture:") and both.contains("- fixture/nested:"),
-      "batch did not report every failing project: " + both,
+      "test did not report every failing project: " + both,
     )
 
     # The test files of a project are a collection too.
@@ -246,17 +246,18 @@ type E2e {
     assert(duplicateFile == "rejected", "subset accepted a duplicate test file")
     let noFiles = tests.subset(keys: empty)
     assert(noFiles.keys.length == 0, "empty subset is not empty")
-    assert(noFiles.batch.runs.{{shard}}.length == 0, "an empty subset plans runs")
-    run(noFiles.batch.test(syntheticWs))
+    assert(noFiles.runs.{{shard}}.length == 0, "an empty subset plans runs")
+    noFiles.test(syntheticWs)
     null
   }
 
   """
-  The batch tests every project against the wired service, and report works.
+  The projects' test function tests every project against the wired service,
+  and report works.
   """
-  batchCheck(ws: Workspace!): Void @check {
+  projectsCheck(ws: Workspace!): Void @check {
     let w = root(ws)
-    wired.projects(w).batch.test(w)
+    wired.projects(w).test(w)
     let report = playwright.project(w, "fixture").report(w)
     assert(report.entries.contains("index.html"), "report has no index.html")
     null
@@ -367,10 +368,20 @@ type E2e {
       .withNewFile("rr/integration/a-test.ts", body)
       .withNewFile("rr/integration/helpers/b-test.ts", body)
       .withNewFile("rr/integration/c.spec.ts", body)
-      # Nothing to find statically: the project still gets the "." key.
+      # A const bound to a literal is read through its name.
+      .withNewFile(
+        "named/playwright.config.ts",
+        "const match: string[] = ['**/*.e2e.ts', /\\.pw\\.js$/];\nexport const dir = 'e2e'\nexport default defineConfig({ testDir: dir, testMatch: match });\n",
+      )
+      .withNewFile("named/e2e/a.e2e.ts", body)
+      .withNewFile("named/e2e/b.pw.js", body)
+      .withNewFile("named/e2e/c.spec.ts", body)
+      .withNewFile("named/d.e2e.ts", body)
+      # Nothing to find statically: the project has no keys, not an invented
+      # one, so it offers no checks.
       .withNewFile(
         "opaque/playwright.config.ts",
-        "const match = '**/*.e2e.ts';\nexport default defineConfig({ testMatch: match });\n",
+        "export default defineConfig({ testMatch: process.env.MATCH ?? '**/*.e2e.ts' });\n",
       )
       .withNewFile("opaque/a.e2e.ts", body)
       .asWorkspace
@@ -404,7 +415,8 @@ type E2e {
     expect("kit/test/apps/adapter", "test/test.js")
     expect("kit/test/apps/override", "test/a.test.js")
     expect("rr/integration", "a-test.ts,helpers/b-test.ts")
-    expect("opaque", ".")
+    expect("named", "e2e/a.e2e.ts,e2e/b.pw.js")
+    expect("opaque", "")
 
     # Keys don't depend on the cwd.
     let inside = ws.withWorkdir("testdir/e2e")
@@ -430,17 +442,29 @@ type E2e {
       .withNewFile("runs/tests/b.spec.ts", pass)
       .withNewFile("runs/tests/c.spec.ts", pass)
       .withNewFile("runs/tests/d.spec.ts", pass)
-      # Found by nothing static: its one key, ".", runs the whole project.
+      # A reporter that says it ran and fails the run, which no test does.
+      .withNewFile(
+        "runs/reporter.js",
+        "module.exports = class { printsToStdio() { return true; } onEnd() { console.log('custom reporter ran'); return { status: 'failed' }; } };\n",
+      )
+      # Its testMatch is a const, read through the name.
       .withNewFile(
         "runs/whole/playwright.config.ts",
         "import { defineConfig } from '@playwright/test';\nconst match = '**/*.e2e.ts';\nexport default defineConfig({ testMatch: match });\n",
       )
       .withNewFile("runs/whole/a.e2e.ts", pass)
+      # Found by nothing static: no keys, and its plain test still runs it.
+      .withNewFile(
+        "runs/opaque/playwright.config.ts",
+        "import { defineConfig } from '@playwright/test';\nexport default defineConfig({ testMatch: process.env.MATCH ?? '**/*.e2e.ts' });\n",
+      )
+      .withNewFile("runs/opaque/a.e2e.ts", fail)
       .asWorkspace
   }
 
   """
-  Filtered runs select exactly their files in groups; whole runs shard the project.
+  Filtered runs select exactly their files in groups, and each file's check
+  reads only its own result; whole runs shard the project.
   """
   runCheck: Void @check {
     let ws = runWs
@@ -453,48 +477,76 @@ type E2e {
     )
 
     # Exactly one file, though its name is a substring of a failing one.
-    run(tests.subset(keys: [a]).batch.test(ws))
-    run(tests.get(key: a).test(ws))
-    assert(failed(tests.get(key: aa).test(ws)), "the failing file passed on its own")
+    let justA = tests.subset(keys: [a])
+    justA.test(ws)
+    run(tests.get(key: a).test(ws, selection: justA))
+    let justAa = tests.subset(keys: [aa])
+    assert(failed(tests.get(key: aa).test(ws, selection: justAa)), "the failing file passed on its own")
+
+    # Sharing a run, each file's check reads only its own result.
+    let pair = tests.subset(keys: [a, aa])
+    run(tests.get(key: a).test(ws, selection: pair))
+    assert(failed(tests.get(key: aa).test(ws, selection: pair)), "the failing file passed in a shared run")
+    let outside = failure(tests.get(key: "tests/b.spec.ts").test(ws, selection: pair))
+    assert(outside.contains("outside the selection"), "a file outside the selection was not refused: " + outside)
 
     # More files than shards: two groups, in order, each its own container.
     let three = tests.subset(keys: [a, "tests/b.spec.ts", "tests/c.spec.ts"])
-    let groups = three.batch.runs.{{files, shard}}.map { r => r.files.join("+") }.join(" | ")
+    let groups = three.runs.{{files, shard}}.map { r => r.files.join("+") }.join(" | ")
     assert(groups == "tests/a.spec.ts+tests/b.spec.ts | tests/c.spec.ts", "unexpected groups: " + groups)
-    run(three.batch.test(ws))
+    three.test(ws)
 
-    # A failing group is reported, and only that group.
-    let failure = {
-      run(tests.subset(keys: [a, aa]).batch.test(ws))
+    # A failing file is reported, and only that file.
+    let failing = {
+      pair.test(ws)
       "unexpected success"
     } rescue {
       err: Error => err.message
     }
-    assert(failure.contains("- tests/aa.spec.ts:"), "the failing group was not reported: " + failure)
-    assert(failure.contains("- tests/a.spec.ts:") == false, "a passing group was reported: " + failure)
+    assert(failing.contains("- tests/aa.spec.ts:"), "the failing file was not reported: " + failing)
+    assert(failing.contains("- tests/a.spec.ts:") == false, "a passing file was reported: " + failing)
+    assert(failing.contains("expect(received).toBe(expected)"), "the failure lost its error: " + failing)
 
-    # The reporters setting replaces list: junit without an output file
-    # prints its XML, which ends the failure's output.
-    let junit = {
-      run(playwright(reporters: ["junit"]).projects(ws).get(key: "runs").tests(ws).get(key: aa).test(ws))
-      "unexpected success"
-    } rescue {
-      err: Error => err.message
-    }
-    assert(junit.contains("</testsuites>"), "the reporters setting was not used: " + junit)
+    # The reporters setting replaces list: this reporter fails the run and
+    # says so, which only shows when it is used.
+    let custom = failure(
+      playwright(reporters: ["./reporter.js"]).projects(ws).get(key: "runs").tests(ws).get(key: a).test(ws, selection: justA),
+    )
+    assert(custom.contains("custom reporter ran"), "the reporters setting was not used: " + custom)
 
     # The whole run is one container per shard, and it fails.
-    let whole = tests.batch.runs.{{files, shard}}
+    let project = playwright(shards: 2).projects(ws).get(key: "runs")
+    let whole = project.runs.{{files, shard}}
     assert(
       whole.map { r => r.shard }.join(",") == "1/2,2/2",
       "a whole run is not one run per shard: " + whole.map { r => r.shard }.join(","),
     )
-    assert(failed(tests.batch.test(ws)), "the whole run missed the failing file")
+    let wholeFailure = {
+      project.test(ws)
+      "unexpected success"
+    } rescue {
+      err: Error => err.message
+    }
+    assert(
+      wholeFailure.contains("- tests/aa.spec.ts:") and wholeFailure.contains("- tests/a.spec.ts:") == false,
+      "the whole run did not blame just the failing file: " + wholeFailure,
+    )
 
-    # A project static discovery can't read runs whole through its "." key.
-    let opaque = playwright.projects(ws).get(key: "runs/whole").tests(ws)
-    assert(opaque.keys.join(",") == ".", "unexpected keys: " + opaque.keys.join(","))
-    run(opaque.get(key: ".").test(ws))
+    # A testMatch bound to a const finds its file, which runs.
+    let named = playwright.projects(ws).get(key: "runs/whole").tests(ws)
+    assert(named.keys.join(",") == "a.e2e.ts", "unexpected keys: " + named.keys.join(","))
+    run(named.get(key: "a.e2e.ts").test(ws, selection: named))
+
+    # A project without keys offers no checks, and test runs it whole.
+    let opaque = playwright.projects(ws).get(key: "runs/opaque")
+    assert(opaque.tests(ws).keys.length == 0, "invented keys: " + opaque.tests(ws).keys.join(","))
+    let opaqueFailure = {
+      opaque.test(ws)
+      "unexpected success"
+    } rescue {
+      err: Error => err.message
+    }
+    assert(opaqueFailure.contains("a.e2e.ts"), "the keyless project's failure was lost: " + opaqueFailure)
 
     # report adds the html reporter, which this config doesn't configure.
     let report = playwright.projects(ws).get(key: "runs").report(ws)
@@ -614,19 +666,285 @@ type E2e {
       .withNewFile("bare/a.spec.ts", pass)
       .asWorkspace
     let tool = playwright(environment: ["GREETING=hello=world"])
-    run(tool.projects(ws).get(key: "pnpm/apps/web").tests(ws).batch.test(ws))
+    tool.projects(ws).get(key: "pnpm/apps/web").tests(ws).test(ws)
 
-    let broken = failure(
-      tool.projects(ws).get(key: "bare").tests(ws).batch.test(ws),
-    )
+    let broken = {
+      tool.projects(ws).get(key: "bare").tests(ws).test(ws)
+      "passed"
+    } rescue {
+      err: Error => err.message
+    }
     assert(broken.contains("install failed (npm install, exit"), "the install failure was not named: " + broken)
-    let missing = failure(
-      playwright(installFlags: ["--ignore-scripts"]).projects(ws).get(key: "bare").tests(ws).batch.test(ws),
-    )
+    let missing = {
+      playwright(installFlags: ["--ignore-scripts"]).projects(ws).get(key: "bare").tests(ws).test(ws)
+      "passed"
+    } rescue {
+      err: Error => err.message
+    }
     assert(
       missing.contains("@playwright/test is not installed"),
       "a project without Playwright did not fail clearly: " + missing,
     )
+    null
+  }
+
+  # Only the unindented CHECKS header counts: nested TESTS summaries count
+  # Playwright's tests, not Dagger's checks.
+  let checkSummaryMatches(output: String!, passed: Int!, failed: Int!): Boolean! {
+    let headers = output.split("\n").filter { line =>
+      line.hasPrefix("CHECKS ") or line.hasPrefix("== CHECKS ==")
+    }
+    let expected = (if (failed > 0) { ["✘", `${failed}`, "failed"] } else { [] })
+      + (if (passed > 0) { ["✔", `${passed}`, "passed"] } else { [] })
+    let words = (headers[0] ?? "").trimPrefix("== ").trimPrefix("CHECKS").trimPrefix(" ==").trimSpace.split(" ").filter { word =>
+      word != ""
+    }
+    headers.length == 1 and words == expected
+  }
+
+  """
+  The check-summary parser counts only the top-level CHECKS header.
+  """
+  selectedSummaryCheck: Void @check {
+    let nested = "CHECKS  ✘ 4 failed\n  TESTS\n    ✘ 1 failed\n    ✔ 3 passed\n"
+    assert(checkSummaryMatches(nested, 3, 1) == false, "nested test counts hid failed checks")
+    assert(checkSummaryMatches(nested, 0, 4), "zero passing checks were not recognized")
+    assert(checkSummaryMatches("== CHECKS ==  ✘ 1 failed  ✔ 3 passed\n", 3, 1), "the report header was not recognized")
+    assert(checkSummaryMatches("CHECKS  ✔ 14 passed\n", 4, 0) == false, "accepted a partial count")
+    assert(checkSummaryMatches("  CHECKS  ✔ 4 passed\n", 4, 0) == false, "accepted a nested header")
+    null
+  }
+
+  # Run `dagger check` on a fixture workspace that installs this module, and
+  # return its exit status and output. Selection has to go through the CLI:
+  # direct Dang calls don't apply the engine's filtered collection view. The
+  # engine supplies its matching CLI.
+  let selectedRun(ws: Workspace!, fixture: Directory!, args: [String!]!): Container! {
+    container
+      .from("alpine:3.23")
+      # Workspace.search runs in the client: BusyBox grep can't serve it.
+      .withExec(["apk", "add", "--no-cache", "ripgrep", "grep"])
+      .withEnvVariable("NO_COLOR", "1")
+      .withDirectory("/source", ws.directory("/", exclude: ["**/node_modules", "reporter/dist", ".git"]))
+      .withDirectory("/work", fixture)
+      .withNewFile("/work/.git/HEAD", "ref: refs/heads/main\n")
+      .withNewFile("/work/dagger.toml", "[modules.playwright]\nsource = \"/source\"\n")
+      .withWorkdir("/work")
+      .withExec(
+        ["/dev/.dagger/dagger", "--progress=report", "check", "--generated=false"] + args,
+        expect: ANY,
+        daggerInDaggerNewSession: true,
+      )
+  }
+
+  # Assert a selected run's check totals and that its output holds messages.
+  let selectedCheck(
+    ws: Workspace!,
+    fixture: Directory!,
+    args: [String!]!,
+    passed: Int!,
+    failed: Int! = 0,
+    messages: [String!]! = [],
+  ): String! {
+    let result = selectedRun(ws, fixture, args)
+    let output = result.stdout + result.stderr
+    assert((result.exitCode == 0) == (failed == 0), "unexpected check exit status:\n" + output)
+    assert(checkSummaryMatches(output, passed, failed), "unexpected Dagger check totals:\n" + output)
+    messages.map { message =>
+      assert(output.contains(message), "missing " + message + ":\n" + output)
+    }
+    output
+  }
+
+  # Two projects, a and b, each with one.spec.ts and two.spec.ts, which pass,
+  # and excluded.spec.ts, which fails if it runs. Every Playwright run starts
+  # with a global setup that picks a run id the tests can see.
+  let selectionFixture: Directory! {
+    let header = "import { test, expect } from '@playwright/test';\n"
+    ["a", "b"].reduce(directory) { dir, p =>
+      dir
+        .withNewFile(p + "/package.json", "{ \"name\": \"" + p + "\", \"private\": true, \"devDependencies\": { \"@playwright/test\": \"1.58.2\" } }\n")
+        .withNewFile(p + "/playwright.config.ts", selectionConfig(""))
+        .withNewFile(
+          p + "/setup.ts",
+          "export default async () => { process.env.RUN_ID = '" + p + "-' + Math.random().toString(36).slice(2); };\n",
+        )
+        .withNewFile(p + "/tests/one.spec.ts", header + "test('one', () => { expect(1).toBe(1); });\n")
+        .withNewFile(p + "/tests/two.spec.ts", header + "test('two', () => { expect(2).toBe(2); });\n")
+        .withNewFile(p + "/tests/excluded.spec.ts", header + "test('excluded', () => { throw new Error('excluded test ran'); });\n")
+    }
+  }
+
+  # The fixture's playwright.config, with extra settings.
+  let selectionConfig(extra: String!): String! {
+    "import { defineConfig } from '@playwright/test';\nexport default defineConfig({ testDir: 'tests', globalSetup: './setup.ts'" + extra + " });\n"
+  }
+
+  let onlyOneAndTwo: [String!]! {
+    ["--playwright-test-file=tests/one.spec.ts", "--playwright-test-file=tests/two.spec.ts"]
+  }
+
+  """
+  Selected files run in every project, and files selected out don't run.
+  """
+  selectedFilesCheck(ws: Workspace!): Void @check {
+    selectedCheck(ws, selectionFixture, onlyOneAndTwo, passed: 4)
+    null
+  }
+
+  """
+  A project and a file selected together run just that file.
+  """
+  selectedProjectCheck(ws: Workspace!): Void @check {
+    selectedCheck(ws, selectionFixture, ["--playwright-project=a", "--playwright-test-file=tests/one.spec.ts"], passed: 1)
+    null
+  }
+
+  """
+  With nothing selected out, each project runs whole, and a failing file
+  fails only its own check.
+  """
+  selectedWholeCheck(ws: Workspace!): Void @check {
+    selectedCheck(
+      ws,
+      selectionFixture,
+      [],
+      passed: 4,
+      failed: 2,
+      messages: ["Playwright tests in a/tests/excluded.spec.ts: 1 failure", "excluded test ran"],
+    )
+    null
+  }
+
+  """
+  Every selected file of a project shares one Playwright run.
+  """
+  selectedSharedRunCheck(ws: Workspace!): Void @check {
+    # Each test fails with its run's id, so the messages show how many runs
+    # there were: exactly one per project.
+    let header = "import { test } from '@playwright/test';\n"
+    let fixture = ["a", "b"].reduce(selectionFixture) { dir, p =>
+      ["one", "two"].reduce(dir) { d, name =>
+        d.withNewFile(
+          p + "/tests/" + name + ".spec.ts",
+          header + "test('" + name + "', () => { throw new Error('run-id=' + process.env.RUN_ID + '.'); });\n",
+        )
+      }
+    }
+    let output = selectedCheck(ws, fixture, onlyOneAndTwo, passed: 0, failed: 4)
+    ["a", "b"].map { p =>
+      let ids = output.matchAll(Regexp("run-id=(" + p + "-[a-z0-9]+)\\.")).map { m => m.captures[0] ?? "" }.uniq
+      assert(ids.length == 1, "project " + p + " ran " + toString(ids.length) + " times: " + ids.join(", ") + "\n" + output)
+    }
+    null
+  }
+
+  """
+  A failing global setup fails every selected file of its project, and only
+  that project.
+  """
+  selectedSetupFailureCheck(ws: Workspace!): Void @check {
+    let fixture = selectionFixture.withNewFile("a/setup.ts", "export default async () => { throw new Error('setup exploded'); };\n")
+    selectedCheck(ws, fixture, onlyOneAndTwo, passed: 2, failed: 2, messages: ["setup exploded"])
+    null
+  }
+
+  """
+  A file that fails to load fails its check, and the project's other
+  selected files, which Playwright then doesn't run, fail as not run.
+  """
+  selectedLoadErrorCheck(ws: Workspace!): Void @check {
+    let fixture = selectionFixture.withNewFile("a/tests/two.spec.ts", "import { test } from '@playwright/test';\ntest('two', () => { (( });\n")
+    selectedCheck(
+      ws,
+      fixture,
+      onlyOneAndTwo,
+      passed: 2,
+      failed: 2,
+      messages: ["SyntaxError", "did not run: Playwright ran no test because tests/two.spec.ts failed to load"],
+    )
+    null
+  }
+
+  """
+  A failure in a file no check covers fails every check of the run.
+  """
+  selectedOutsideFailureCheck(ws: Workspace!): Void @check {
+    # A testMatch that isn't a literal is read as the default, so static
+    # discovery misses hidden.e2e.ts, which Playwright runs and which fails.
+    let fixture = selectionFixture
+      .withNewFile(
+        "a/playwright.config.ts",
+        selectionConfig(", testMatch: process.env.NEVER ? [] : ['**/*.spec.ts', '**/*.e2e.ts']"),
+      )
+      .withNewFile("a/tests/excluded.spec.ts", "import { test } from '@playwright/test';\ntest('fine', () => {});\n")
+      .withNewFile("a/tests/hidden.e2e.ts", "import { test } from '@playwright/test';\ntest('hidden', () => { throw new Error('hidden failure'); });\n")
+    selectedCheck(
+      ws,
+      fixture,
+      ["--playwright-project=a"],
+      passed: 0,
+      failed: 3,
+      messages: ["failures outside the selected test files", "hidden failure"],
+    )
+    null
+  }
+
+  """
+  A selected file Playwright doesn't run fails as not run instead of passing.
+  """
+  selectedNeverRanCheck(ws: Workspace!): Void @check {
+    # A testIgnore that isn't a literal is read as ignoring nothing, so
+    # excluded.spec.ts is a key that Playwright then ignores.
+    let fixture = selectionFixture.withNewFile(
+      "a/playwright.config.ts",
+      selectionConfig(", testIgnore: process.env.NEVER ? [] : '**/excluded.spec.ts'"),
+    )
+    selectedCheck(
+      ws,
+      fixture,
+      ["--playwright-project=a", "--playwright-test-file=tests/one.spec.ts", "--playwright-test-file=tests/excluded.spec.ts"],
+      passed: 1,
+      failed: 1,
+      messages: ["Playwright tests in a/tests/excluded.spec.ts: did not run"],
+    )
+    null
+  }
+
+  """
+  A project whose config can't be loaded fails alone, naming its config;
+  listing still reads its files with Playwright's defaults.
+  """
+  selectedBrokenConfigCheck(ws: Workspace!): Void @check {
+    let fixture = selectionFixture.withNewFile("a/playwright.config.ts", "this is {{ not ( javascript\n")
+    selectedCheck(
+      ws,
+      fixture,
+      onlyOneAndTwo,
+      passed: 2,
+      failed: 2,
+      messages: ["before reporting any test; config a/playwright.config.ts", "SyntaxError"],
+    )
+    null
+  }
+
+  """
+  Listing runs no install and no Playwright: a project whose install fails,
+  and which has no Playwright at all, still lists its files.
+  """
+  selectedListingCheck(ws: Workspace!): Void @check {
+    let fixture = selectionFixture
+      .withNewFile(
+        "a/package.json",
+        "{ \"name\": \"a\", \"private\": true, \"scripts\": { \"preinstall\": \"exit 3\" }, \"devDependencies\": { \"@playwright/test\": \"0.0.0-does-not-exist\" } }\n",
+      )
+      .withNewFile("a/package-lock.json", "this is not a lockfile\n")
+    let result = selectedRun(ws, fixture, ["-l", "--all"])
+    let output = result.stdout + result.stderr
+    assert(result.exitCode == 0, "listing failed:\n" + output)
+    let rows = output.split("\n").filter { line => line.containsMatch(`^playwright\s+a\s+tests/(?:one|two|excluded)\.spec\.ts\s+test\b`) }
+    assert(rows.length == 3, "listing did not show project a's three files:\n" + output)
+    assert(output.contains("npm install") == false, "listing ran an install:\n" + output)
     null
   }
 }
